@@ -284,7 +284,11 @@ fn summary_from_session(
     })
 }
 
-fn session_roots(provider: ProviderKind) -> anyhow::Result<Vec<PathBuf>> {
+/// The session directories one Pi-family provider writes to. Shared with the
+/// usage scan, which must read exactly the transcripts the driver would have
+/// written: the env overrides, the configured `sessionDir`, and Oh My Pi's
+/// per-profile directories all move sessions off the default path.
+pub(crate) fn session_roots(provider: ProviderKind) -> anyhow::Result<Vec<PathBuf>> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory could not be located"))?;
     let expand_home = |path: PathBuf| {
         if path == Path::new("~") {

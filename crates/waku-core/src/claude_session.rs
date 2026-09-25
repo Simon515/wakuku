@@ -65,7 +65,9 @@ pub fn provider_session_history(
     provider_session_history_in(&projects_directory()?, session_id, turn_limit)
 }
 
-fn projects_directory() -> anyhow::Result<PathBuf> {
+/// Claude's transcript root. Shared with the usage scan, which must read the
+/// same directory the driver writes to, `CLAUDE_CONFIG_DIR` included.
+pub(crate) fn projects_directory() -> anyhow::Result<PathBuf> {
     let config_directory = std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)

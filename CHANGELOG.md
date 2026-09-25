@@ -16,6 +16,8 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+- Cover DeepSeek Harness, Kimi Code, Oh My Pi, and Pi in the Usage page alongside Claude Code and Codex, with per-provider charts, columns, and project attribution
+
 ## [0.1.19]
 
 - Render inline and block LaTeX math in Markdown, with a Copy Expression action and a setting to show the source

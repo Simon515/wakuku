@@ -71,7 +71,7 @@ fn daemon_executable_path() -> anyhow::Result<PathBuf> {
     let current = std::env::current_exe().context("could not locate the Waku executable")?;
 
     // Development keeps the daemon beside Cargo's debug artifacts rather than
-    // inside Waku Debug.app. The supervisor watches this file and swaps only
+    // inside wakuku.app. The supervisor watches this file and swaps only
     // the daemon when the development watcher relinks it.
     #[cfg(debug_assertions)]
     if let Some(debug_directory) = current

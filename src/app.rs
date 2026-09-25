@@ -55,6 +55,7 @@ use crate::browser::BrowserView;
 use crate::persistence::{
     ComposerDraftStore, ComposerDrafts, DEFAULT_RIGHT_PANEL_WIDTH, DEFAULT_SIDEBAR_WIDTH,
     PersistedState, PersistedWindowState, SidebarGrouping, SidebarOrdering, StateStore,
+    ThinkingDisplay,
 };
 use crate::query::{Query, QueryCache};
 use crate::review_diff::{Snapshot as ReviewDiffSnapshot, Source as ReviewDiffSource};
@@ -1307,6 +1308,10 @@ pub struct Waku {
     /// Per-item disclosure overrides. Reasoning starts open while live; tool
     /// details start closed, so the stored bool must preserve either choice.
     expanded_activity_items: HashMap<Uuid, bool>,
+    /// Reasoning previews opened to their full content in the current session.
+    reasoning_previews_expanded: HashSet<Uuid>,
+    /// Cached settled reasoning previews, keyed by activity content identity.
+    reasoning_preview_cache: RefCell<HashMap<Uuid, (usize, usize, Rc<str>, bool)>>,
     /// Settled turns whose folded work the user has reopened.
     expanded_turns: HashSet<Uuid>,
     /// Per-response file cards the user expanded beyond their three-file
@@ -2852,6 +2857,8 @@ impl Waku {
                 last_stream_save: Instant::now(),
                 activities_expanded: HashMap::new(),
                 expanded_activity_items: HashMap::new(),
+                reasoning_previews_expanded: HashSet::new(),
+                reasoning_preview_cache: RefCell::new(HashMap::new()),
                 expanded_turns: HashSet::new(),
                 expanded_changed_files: HashSet::new(),
                 transcript_control_focuses: RefCell::new(HashMap::new()),

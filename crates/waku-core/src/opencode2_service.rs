@@ -638,7 +638,7 @@ fn revalidate(service: &Arc<Opencode2Service>, may_spawn: bool) -> anyhow::Resul
 ///
 /// `serve --service` short-circuits on a healthy incumbent, so it is
 /// idempotent and safe to race — including against a second Waku daemon, which
-/// happens routinely when a release build and `Waku Debug.app` run side by
+/// happens routinely when a release build and `wakuku.app` run side by
 /// side. In that race the in-process condvar does nothing at all, and the
 /// pid-checked rediscovery below is the only thing that converges both
 /// processes on one service.

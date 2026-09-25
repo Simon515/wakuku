@@ -1354,6 +1354,56 @@ pub(super) fn reasoning_activity_title(reasoning: &ReasoningBlock, live: bool) -
     }
 }
 
+/// Keep the default reasoning preview readable without dumping the provider's
+/// full working notes into the transcript. The source cap applies to both
+/// prose and code; an incomplete fenced block is closed so Markdown never
+/// turns the remainder of a preview into an accidental code surface.
+pub(super) const REASONING_PREVIEW_MAX_LINES: usize = 10;
+pub(super) const REASONING_PREVIEW_MAX_CHARS: usize = 1600;
+
+pub(super) fn reasoning_preview_content(content: &str) -> (String, bool) {
+    let mut lines = content.split_inclusive('\n');
+    let mut line_end = 0;
+    for _ in 0..REASONING_PREVIEW_MAX_LINES {
+        let Some(line) = lines.next() else {
+            break;
+        };
+        line_end += line.len();
+    }
+    let truncated_by_lines = lines.next().is_some();
+    let mut end = if truncated_by_lines {
+        line_end
+    } else {
+        content.len()
+    };
+    if end > REASONING_PREVIEW_MAX_CHARS {
+        end = content
+            .char_indices()
+            .nth(REASONING_PREVIEW_MAX_CHARS)
+            .map_or(content.len(), |(index, _)| index);
+    }
+    let truncated = end < content.len();
+    if !truncated {
+        return (content.to_owned(), false);
+    }
+
+    let mut preview = content[..end].trim_end().to_owned();
+    let fence_open = preview
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            line.starts_with("```") || line.starts_with("~~~")
+        })
+        .count()
+        % 2
+        == 1;
+    preview.push_str("\n…");
+    if fence_open {
+        preview.push_str("\n```");
+    }
+    (preview, true)
+}
+
 fn activity_path_name(path: &str) -> String {
     Path::new(path)
         .file_name()

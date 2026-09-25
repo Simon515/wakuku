@@ -366,18 +366,26 @@ export function providerMeta(provider: ProviderKind) {
 export function ProviderIcon({
   provider,
   className,
+  color,
   label,
 }: {
   provider: ProviderKind
   className?: string
+  /**
+   * Overrides the mark's colour. Brand marks are mostly the neutral
+   * foreground, which cannot tell several providers apart on one chart, so
+   * surfaces that plot providers side by side pass their own hue.
+   */
+  color?: string
   label?: string
 }) {
   return (
     <span
       aria-hidden={label ? undefined : true}
       aria-label={label}
-      className={`inline-grid size-4 shrink-0 place-items-center ${providerColor(provider)} ${className ?? ''}`}
+      className={`inline-grid size-4 shrink-0 place-items-center ${color ? '' : providerColor(provider)} ${className ?? ''}`}
       role={label ? 'img' : undefined}
+      style={color ? { color } : undefined}
     >
       <span
         aria-hidden="true"

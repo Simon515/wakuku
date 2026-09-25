@@ -892,6 +892,38 @@ impl Waku {
         });
     }
 
+    fn cached_reasoning_preview(&self, id: Uuid, content: &str) -> (Rc<str>, bool) {
+        let pointer = content.as_ptr() as usize;
+        let length = content.len();
+        let mut cache = self.reasoning_preview_cache.borrow_mut();
+        let refresh = cache
+            .get(&id)
+            .is_none_or(|(cached_pointer, cached_length, _, _)| {
+                *cached_pointer != pointer || *cached_length != length
+            });
+        if refresh {
+            let (preview, truncated) = reasoning_preview_content(content);
+            cache.insert(id, (pointer, length, Rc::from(preview), truncated));
+        }
+        let (_, _, preview, truncated) = cache
+            .get(&id)
+            .expect("reasoning preview cache entry inserted above");
+        (preview.clone(), *truncated)
+    }
+
+    pub(super) fn expand_reasoning_preview(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        let block_index = self
+            .selected_transcript_blocks()
+            .iter()
+            .position(|block| block.activities.iter().any(|activity| activity.id == id));
+        let Some(block_index) = block_index else {
+            return;
+        };
+        self.toggle_block_disclosure(block_index, cx, |this| {
+            this.reasoning_previews_expanded.insert(id);
+        });
+    }
+
     /// Opens a file a tool changed in the right panel's viewer.
     ///
     /// Sits inside a row that toggles on click, so it stops the press from
@@ -1890,11 +1922,12 @@ impl Waku {
                     )
                 })
         });
+        let show_work = self.state.thinking_display != ThinkingDisplay::Folded;
         let expanded = self
             .activities_expanded
             .get(&block_index)
             .copied()
-            .unwrap_or(live_group);
+            .unwrap_or(live_group || (show_work && !activities.is_empty()));
         let live_reasoning_id = (self
             .selected_runtime()
             .is_some_and(|runtime| runtime.stream_phase == Some(StreamPhase::Reasoning))
@@ -2066,7 +2099,7 @@ impl Waku {
                     .expanded_activity_items
                     .get(&id)
                     .copied()
-                    .unwrap_or(reasoning_live);
+                    .unwrap_or(reasoning_live || (show_work && reasoning.is_some()));
             let item_focus = self.transcript_control_focus(format!("activity-item-{id}"), cx);
             let mut item = div()
                 .w_full()
@@ -2182,6 +2215,13 @@ impl Waku {
                 // Reasoning remains model prose even though it now shares the
                 // activity stream, so keep selectable markdown rather than
                 // presenting it as monospace tool output.
+                let preview_content = (!reasoning_live
+                    && self.state.thinking_display == ThinkingDisplay::Preview
+                    && !self.reasoning_previews_expanded.contains(&id))
+                .then(|| self.cached_reasoning_preview(id, &reasoning.content));
+                let preview_truncated = preview_content
+                    .as_ref()
+                    .is_some_and(|(_, truncated)| *truncated);
                 let mut palette = MarkdownPalette::from_theme(theme);
                 palette.text = theme.text_secondary;
                 palette.secondary = theme.text_tertiary;
@@ -2206,7 +2246,10 @@ impl Waku {
                     view.set_text(&reasoning.content[start..], true);
                 } else {
                     self.reasoning_window_starts.borrow_mut().remove(&id);
-                    view.set_text(&reasoning.content, false);
+                    let source = preview_content
+                        .as_ref()
+                        .map_or(reasoning.content.as_str(), |(content, _)| content.as_ref());
+                    view.set_text(source, false);
                 }
                 let wheel_scroll = reasoning_viewport.scroll_handle.clone();
                 let wheel_follow_tail = reasoning_viewport.follow_tail.clone();
@@ -2269,7 +2312,47 @@ impl Waku {
                             &reasoning_viewport.scroll_handle,
                             &reasoning_viewport.scrollbar,
                         ))
-                        .child(activity_scroll_guard(reasoning_viewport, reasoning_live)),
+                        .child(activity_scroll_guard(reasoning_viewport, reasoning_live))
+                        .when(preview_truncated, |element| {
+                            element.child(
+                                div()
+                                    .id(SharedString::from(format!("reasoning-more-{id}")))
+                                    .h(px(30.0))
+                                    .px(px(12.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .border_t_1()
+                                    .border_color(theme.border_strong)
+                                    .text_size(sp(12.5))
+                                    .text_color(theme.accent)
+                                    .cursor_default()
+                                    .hover(|style| style.bg(theme.overlay))
+                                    .focus_visible(|style| {
+                                        style.border_1().border_color(theme.accent)
+                                    })
+                                    .tab_index(0)
+                                    .child(tr!("transcript.show_full_thought"))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.expand_reasoning_preview(id, cx);
+                                    }))
+                                    .on_key_down(cx.listener(
+                                        move |this, event: &KeyDownEvent, _, cx| {
+                                            if matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            ) {
+                                                cx.stop_propagation();
+                                                this.expand_reasoning_preview(id, cx);
+                                            }
+                                        },
+                                    )),
+                            )
+                        }),
                 );
             }
             if item_expanded && shows_diff {

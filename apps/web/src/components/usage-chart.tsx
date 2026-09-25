@@ -6,13 +6,19 @@ import { tooltip } from '@tanstack/charts/tooltip'
 import type { UsageHistory } from '@waku/client'
 import { scaleUtc } from 'd3-scale'
 import { useI18n, type AppLocale } from '@/lib/i18n'
+import {
+  USAGE_PROVIDER_COLORS,
+  USAGE_PROVIDER_LABELS,
+  usageChartedProviders,
+  usageProviderValue,
+} from '@/lib/usage-presentation'
 
 export type UsageMetric = 'cost' | 'tokens'
 
 interface UsageChartRow {
   id: string
   date: Date
-  provider: 'Claude Code' | 'Codex'
+  provider: string
   value: number
 }
 
@@ -24,23 +30,17 @@ export function UsageTrendChart({
   metric: UsageMetric
 }) {
   const { locale, t } = useI18n()
-  const rows: UsageChartRow[] = history.daily.flatMap((day) => {
-    const date = parseUsageDay(day.day)
-    return [
-      {
-        id: `claude-${day.day}`,
-        date,
-        provider: 'Claude Code',
-        value: metric === 'cost' ? day.byProvider[0].costUsd : day.byProvider[0].totalTokens,
-      },
-      {
-        id: `codex-${day.day}`,
-        date,
-        provider: 'Codex',
-        value: metric === 'cost' ? day.byProvider[1].costUsd : day.byProvider[1].totalTokens,
-      },
-    ]
-  })
+  // Only the providers this window used get a band: a provider with no usage
+  // would only draw a flat zero line and an empty tooltip row.
+  const charted = usageChartedProviders(history)
+  const rows: UsageChartRow[] = history.daily.flatMap((day) =>
+    charted.map((provider) => ({
+      id: `${provider}-${day.day}`,
+      date: parseUsageDay(day.day),
+      provider: USAGE_PROVIDER_LABELS[provider],
+      value: usageProviderValue(day.byProvider, provider, metric === 'cost'),
+    })),
+  )
 
   const definition = defineChart({
     marks: [
@@ -98,8 +98,8 @@ export function UsageTrendChart({
       },
     },
     color: {
-      domain: ['Claude Code', 'Codex'],
-      range: ['#d97757', 'var(--provider-codex)'],
+      domain: charted.map((provider) => USAGE_PROVIDER_LABELS[provider]),
+      range: charted.map((provider) => USAGE_PROVIDER_COLORS[provider]),
     },
     focus: 'group-x',
     maxFocusDistance: Number.POSITIVE_INFINITY,

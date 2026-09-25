@@ -83,7 +83,15 @@
   --activity-active-surface: color-mix(in srgb, var(--background) 93.5%, var(--foreground) 6.5%);
   --success: #2f8f52;
   --warning: #a66b20;
+  /* One hue per usage provider: brand colour where a mark has one, and a
+     distinct hue for the providers whose marks share the neutral colour.
+     Mirrors the desktop page's `usage_chart_color`. */
+  --provider-claude: #d97757;
   --provider-codex: #34363b;
+  --provider-deepseek: #4d6bfe;
+  --provider-kimi: #8b5cf6;
+  --provider-ohmypi: #10b981;
+  --provider-pi: #0ea5e9;
   --danger-soft: rgb(198 74 66 / 10%);
   --code-text: #9a5528;
   --code-wash: rgb(28 31 37 / 7%);
@@ -127,7 +135,12 @@
   --activity-active-surface: color-mix(in srgb, var(--background) 93.5%, var(--foreground) 6.5%);
   --success: #62c987;
   --warning: #e0b36a;
+  --provider-claude: #d97757;
   --provider-codex: #f3f3f3;
+  --provider-deepseek: #4d6bfe;
+  --provider-kimi: #8b5cf6;
+  --provider-ohmypi: #10b981;
+  --provider-pi: #0ea5e9;
   --danger-soft: rgb(226 114 106 / 10%);
   --code-text: #e0a882;
   --code-wash: rgb(230 230 230 / 8%);
