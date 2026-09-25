@@ -187,6 +187,7 @@ pub struct ModelSlice {
     pub cost_usd: f64,
     pub total_tokens: u64,
     pub cost_share: f64,
+    pub token_share: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, TS)]
@@ -208,8 +209,11 @@ pub struct DaySlice {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CostQuality {
-    pub provider_reported_share: f64,
-    pub model_priced_share: f64,
+    /// Records priced from the official model rate table.
+    pub official_priced_share: f64,
+    /// Records priced from OpenRouter's catalog because the official table
+    /// omits the model.
+    pub openrouter_priced_share: f64,
     pub unpriced_share: f64,
     pub cache_savings_usd: f64,
 }

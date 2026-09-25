@@ -43,9 +43,10 @@ const USAGE_WINDOWS: Array<{ window: UsageWindow; labelKey: string }> = [
 export function UsageSettings({ projects }: { projects: Project[] }) {
   const { locale, t } = useI18n()
   const [view, setView] = useState<UsageView>('daily')
-  const [window, setWindow] = useState<UsageWindow>({ trailingDays: 30 })
-  const [metric, setMetric] = useState<UsageMetric>('cost')
+  const [window, setWindow] = useState<UsageWindow>({ trailingDays: 7 })
+  const [metric, setMetric] = useState<UsageMetric>('tokens')
   const [breakdown, setBreakdown] = useState<UsageBreakdown>('model')
+  const [modelSortByCost, setModelSortByCost] = useState(false)
   const [projectFilter, setProjectFilter] = useState('')
   const requestedWindow: UsageWindow = view === 'monthly' ? { months: 12 } : window
   const usage = useUsageHistory(requestedWindow, projects)
@@ -104,7 +105,7 @@ export function UsageSettings({ projects }: { projects: Project[] }) {
       ) : (
         <>
           {view === 'daily' && (
-            <DailyUsage history={history} metric={metric} breakdown={breakdown} onMetricChange={setMetric} onBreakdownChange={setBreakdown} />
+            <DailyUsage history={history} metric={metric} breakdown={breakdown} modelSortByCost={modelSortByCost} onMetricChange={setMetric} onBreakdownChange={setBreakdown} onModelSortByCostChange={setModelSortByCost} />
           )}
           {view === 'monthly' && <MonthlyUsage history={history} />}
           {view === 'projects' && (
@@ -128,14 +129,18 @@ function DailyUsage({
   history,
   metric,
   breakdown,
+  modelSortByCost,
   onMetricChange,
   onBreakdownChange,
+  onModelSortByCostChange,
 }: {
   history: UsageHistory
   metric: UsageMetric
   breakdown: UsageBreakdown
+  modelSortByCost: boolean
   onMetricChange: (metric: UsageMetric) => void
   onBreakdownChange: (breakdown: UsageBreakdown) => void
+  onModelSortByCostChange: (byCost: boolean) => void
 }) {
   const { t } = useI18n()
   return (
@@ -168,6 +173,13 @@ function DailyUsage({
         <div className="min-w-0 flex-1 self-stretch">
           <div className="flex items-center gap-3">
             <div className="min-w-0 flex-1 text-[12.5px] font-medium">{t('usage.breakdown')}</div>
+            {breakdown === 'model' && (
+              <MiniSegmented
+                options={[['tokens', t('usage.tokens_upper')], ['cost', t('usage.cost_upper')]]}
+                value={modelSortByCost ? 'cost' : 'tokens'}
+                onChange={(next) => onModelSortByCostChange(next === 'cost')}
+              />
+            )}
             <MiniSegmented
               options={[['model', t('usage.model_upper')], ['day', t('usage.day_upper')]]}
               value={breakdown}
@@ -175,7 +187,7 @@ function DailyUsage({
             />
           </div>
           <div className="mt-2 min-w-0 overflow-x-auto">
-            {breakdown === 'model' ? <ModelTable models={history.models} /> : <DayTable days={history.daily} charted={usageChartedProviders(history)} />}
+            {breakdown === 'model' ? <ModelTable models={history.models} byCost={modelSortByCost} /> : <DayTable days={history.daily} charted={usageChartedProviders(history)} />}
           </div>
         </div>
         <UsageQuality history={history} />
@@ -275,21 +287,24 @@ function UsageMetricStrip({ history }: { history: UsageHistory }) {
   )
 }
 
-function ModelTable({ models }: { models: ModelSlice[] }) {
+function ModelTable({ models, byCost }: { models: ModelSlice[]; byCost: boolean }) {
   const { locale, t } = useI18n()
+  const rows = byCost
+    ? [...models].sort((left, right) => right.costUsd - left.costUsd || right.totalTokens - left.totalTokens)
+    : models
   return (
     <UsageTable
-      columns={<><span className="flex-1">{t('usage.model')}</span><span className="w-20 text-right">{t('usage.cost')}</span><span className="w-16 text-right">{t('usage.share')}</span><span className="w-20 text-right">{t('usage.tokens')}</span></>}
+      columns={<><span className="flex-1">{t('usage.model')}</span><span className="w-20 text-right">{t('usage.tokens')}</span><span className="w-16 text-right">{t('usage.share')}</span><span className="w-20 text-right">{t('usage.cost')}</span></>}
     >
-      {models.length ? models.map((model) => (
+      {rows.length ? rows.map((model) => (
         <div className="flex min-w-[500px] items-center gap-3 border-b py-2 text-[11.5px]" key={`${model.provider}:${model.model}`}>
           <span className="flex min-w-0 flex-1 items-center gap-2">
             <ProviderIcon className="size-3" color={USAGE_PROVIDER_COLORS[model.provider]} provider={model.provider} />
             <span className="truncate">{model.model}</span>
           </span>
-          <span className="w-20 text-right tabular-nums">{formatMoney(model.costUsd, locale)}</span>
-          <span className="w-16 text-right tabular-nums text-[var(--text-tertiary)]">{formatPercent(model.costShare, locale)}</span>
-          <span className="w-20 text-right tabular-nums text-[var(--text-tertiary)]">{formatNumber(model.totalTokens, locale)}</span>
+          <span className="w-20 text-right tabular-nums">{formatNumber(model.totalTokens, locale)}</span>
+          <span className="w-16 text-right tabular-nums text-[var(--text-tertiary)]">{formatPercent(byCost ? model.costShare : model.tokenShare, locale)}</span>
+          <span className="w-20 text-right tabular-nums text-[var(--text-tertiary)]">{formatMoney(model.costUsd, locale)}</span>
         </div>
       )) : <UsageEmpty />}
     </UsageTable>
@@ -339,8 +354,8 @@ function UsageTable({ columns, children }: { columns: ReactNode; children: React
 function UsageQuality({ history }: { history: UsageHistory }) {
   const { locale, t } = useI18n()
   const rows = [
-    [t('usage.provider_reported'), formatPercent(history.quality.providerReportedShare, locale)],
-    [t('usage.model_priced'), formatPercent(history.quality.modelPricedShare, locale)],
+    [t('usage.official_priced'), formatPercent(history.quality.officialPricedShare, locale)],
+    [t('usage.openrouter_priced'), formatPercent(history.quality.openrouterPricedShare, locale)],
     [t('usage.unpriced'), formatPercent(history.quality.unpricedShare, locale)],
     [t('usage.cache_savings'), formatMoney(history.quality.cacheSavingsUsd, locale)],
   ]

@@ -39,6 +39,9 @@ const MTIME_SLACK: Duration = Duration::from_secs(36 * 3600);
 
 const LITELLM_RATES_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+/// Fallback for models the LiteLLM table prices incompletely: OpenRouter's
+/// public catalog carries per-token pricing for its own routing catalog.
+const OPENROUTER_RATES_URL: &str = "https://openrouter.ai/api/v1/models";
 const RATES_CACHE_FILE: &str = "usage-model-rates.json";
 /// Rates move rarely; a day-old table keeps the page working offline.
 const RATES_TTL: Duration = Duration::from_secs(24 * 3600);
@@ -55,7 +58,6 @@ pub struct UsageRecord {
     /// not say.
     pub project: String,
     pub totals: TokenTotals,
-    pub reported_cost_usd: Option<f64>,
     /// Key for cross-file de-duplication, or `None` when the record is
     /// inherently unique and needs no dedup.
     pub dedupe_key: Option<String>,
@@ -165,10 +167,7 @@ fn parse_claude_line(line: &str) -> Option<UsageRecord> {
             // Anthropic folds thinking tokens into output without a breakout.
             reasoning: 0,
         },
-        reported_cost_usd: record
-            .get("costUSD")
-            .and_then(Value::as_f64)
-            .filter(|cost| cost.is_finite()),
+
         dedupe_key,
     })
 }
@@ -379,8 +378,6 @@ fn parse_codex_line(line: &str, state: &mut CodexScanState) -> Option<UsageRecor
         session_id: state.session_id.clone(),
         project: state.cwd.clone(),
         totals,
-        // Codex does not report cost in the rollout.
-        reported_cost_usd: None,
         // Fork copies were suppressed while parsing the physical rollout, so
         // surviving events are unique and need no global deduplication.
         dedupe_key: None,
@@ -481,11 +478,6 @@ fn parse_pi_line(
         session_id: state.session_id.clone(),
         project: state.cwd.clone(),
         totals,
-        reported_cost_usd: usage
-            .get("cost")
-            .and_then(|cost| cost.get("total"))
-            .and_then(Value::as_f64)
-            .filter(|cost| cost.is_finite()),
         dedupe_key: record
             .get("id")
             .and_then(Value::as_str)
@@ -595,7 +587,6 @@ fn parse_kimi_line(line: &str, state: &KimiScanState) -> Option<UsageRecord> {
         session_id: state.session_id.clone(),
         project: state.workspace.clone(),
         totals: usage,
-        reported_cost_usd: None,
         dedupe_key,
     })
 }
@@ -680,7 +671,6 @@ fn parse_dsh_line(line: &str, state: &mut DshScanState) -> Option<UsageRecord> {
         session_id: state.session_id.clone(),
         project: state.cwd.clone(),
         totals,
-        reported_cost_usd: None,
         dedupe_key: record
             .get("seq")
             .and_then(Value::as_i64)
@@ -705,7 +695,10 @@ pub struct ModelRate {
 
 #[derive(Clone, Debug)]
 pub struct RateTable {
+    /// Official model pricing; tried before the OpenRouter fallback.
     pub rates: HashMap<String, ModelRate>,
+    /// Per-token pricing from OpenRouter's catalog for models missing above.
+    pub openrouter: HashMap<String, ModelRate>,
     pub status: PricingStatus,
 }
 
@@ -713,6 +706,7 @@ impl RateTable {
     pub fn unavailable() -> Self {
         Self {
             rates: HashMap::new(),
+            openrouter: HashMap::new(),
             status: PricingStatus::Unavailable,
         }
     }
@@ -742,12 +736,25 @@ fn normalize_model_name(model: &str) -> String {
     }
 }
 
+/// Rates follow the official model price list; models the list prices
+/// incompletely fall back to OpenRouter's published catalog pricing.
 fn lookup_rate<'a>(table: &'a RateTable, model: &str) -> Option<&'a ModelRate> {
+    lookup_rate_with_source(table, model).map(|(rate, _)| rate)
+}
+
+fn lookup_rate_with_source<'a>(table: &'a RateTable, model: &str) -> Option<(&'a ModelRate, CostSource)> {
     let normalized = normalize_model_name(model);
     if normalized.is_empty() || UNPRICEABLE_MODELS.contains(&normalized.as_str()) {
         return None;
     }
-    table.rates.get(&normalized)
+    if let Some(rate) = table.rates.get(&normalized) {
+        Some((rate, CostSource::Official))
+    } else {
+        table
+            .openrouter
+            .get(&normalized)
+            .map(|rate| (rate, CostSource::OpenRouter))
+    }
 }
 
 /// Projects the LiteLLM document into a rate table. Entries without both an
@@ -786,6 +793,53 @@ fn parse_rate_table(document: &Value) -> HashMap<String, ModelRate> {
     table
 }
 
+/// Projects OpenRouter's model catalog into a rate table. Prices are USD
+/// strings per token; entries without both a prompt and a completion rate are
+/// dropped, mirroring the official table's rule. OpenRouter lists cache reads
+/// (and rarely writes) as separate fields, falling back to the plain input
+/// rate when absent.
+fn parse_openrouter_table(document: &Value) -> HashMap<String, ModelRate> {
+    let mut table = HashMap::new();
+    let Some(entries) = document.get("data").and_then(Value::as_array) else {
+        return table;
+    };
+    let rate = |entry: &serde_json::Map<String, Value>, key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    };
+    for entry in entries {
+        let Some(entry) = entry.as_object() else {
+            continue;
+        };
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let pricing = match entry.get("pricing").and_then(Value::as_object) {
+            Some(pricing) => pricing,
+            None => continue,
+        };
+        let Some(input) = rate(pricing, "prompt") else {
+            continue;
+        };
+        let Some(output) = rate(pricing, "completion") else {
+            continue;
+        };
+        table.insert(
+            normalize_model_name(id),
+            ModelRate {
+                input,
+                output,
+                cache_read: rate(pricing, "input_cache_read").unwrap_or(input),
+                cache_creation: rate(pricing, "input_cache_write").unwrap_or(input),
+            },
+        );
+    }
+    table
+}
+
 fn unix_time_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -793,85 +847,126 @@ fn unix_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn read_rates_cache(path: &Path) -> Option<(i64, HashMap<String, ModelRate>)> {
+fn read_rates_cache(
+    path: &Path,
+) -> Option<(
+    i64,
+    HashMap<String, ModelRate>,
+    HashMap<String, ModelRate>,
+)> {
     let document: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     let fetched_at_ms = document.get("fetched_at_ms")?.as_i64()?;
-    let mut rates = HashMap::new();
-    for (name, entry) in document.get("rates")?.as_object()? {
-        let values = entry.as_array()?;
-        let field = |index: usize| values.get(index).and_then(Value::as_f64);
-        rates.insert(
-            name.clone(),
-            ModelRate {
-                input: field(0)?,
-                output: field(1)?,
-                cache_read: field(2)?,
-                cache_creation: field(3)?,
-            },
-        );
-    }
-    Some((fetched_at_ms, rates))
+    let parse = |key: &str| -> Option<HashMap<String, ModelRate>> {
+        let mut rates = HashMap::new();
+        for (name, entry) in document.get(key)?.as_object()? {
+            let values = entry.as_array()?;
+            let field = |index: usize| values.get(index).and_then(Value::as_f64);
+            rates.insert(
+                name.clone(),
+                ModelRate {
+                    input: field(0)?,
+                    output: field(1)?,
+                    cache_read: field(2)?,
+                    cache_creation: field(3)?,
+                },
+            );
+        }
+        Some(rates)
+    };
+    // Caches written before the OpenRouter fallback existed carry only the
+    // official table; the fallback refetches with the next TTL.
+    Some((fetched_at_ms, parse("rates")?, parse("openrouter").unwrap_or_default()))
 }
 
-fn write_rates_cache(path: &Path, fetched_at_ms: i64, rates: &HashMap<String, ModelRate>) {
-    let entries: serde_json::Map<String, Value> = rates
-        .iter()
-        .map(|(name, rate)| {
-            (
-                name.clone(),
-                serde_json::json!([
-                    rate.input,
-                    rate.output,
-                    rate.cache_read,
-                    rate.cache_creation
-                ]),
-            )
-        })
-        .collect();
-    let document = serde_json::json!({ "fetched_at_ms": fetched_at_ms, "rates": entries });
+fn write_rates_cache(
+    path: &Path,
+    fetched_at_ms: i64,
+    rates: &HashMap<String, ModelRate>,
+    openrouter: &HashMap<String, ModelRate>,
+) {
+    let entries = |rates: &HashMap<String, ModelRate>| {
+        rates
+            .iter()
+            .map(|(name, rate)| {
+                (
+                    name.clone(),
+                    serde_json::json!([
+                        rate.input,
+                        rate.output,
+                        rate.cache_read,
+                        rate.cache_creation
+                    ]),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>()
+    };
+    let document = serde_json::json!({
+        "fetched_at_ms": fetched_at_ms,
+        "rates": entries(rates),
+        "openrouter": entries(openrouter),
+    });
     // Best effort: a cache that fails to write only costs the next scan a
     // refetch.
     let _ = std::fs::write(path, document.to_string());
 }
 
-/// Load the LiteLLM rate table, preferring the on-disk snapshot while it is
-/// within TTL, refetching otherwise, and degrading to the stale snapshot or an
-/// empty table rather than failing the scan. Blocking: disk plus up to one
-/// HTTPS round trip. Never call from the UI thread.
+/// Load the rate tables, preferring the on-disk snapshot while it is within
+/// TTL, refetching otherwise, and degrading to the stale snapshot or an empty
+/// table rather than failing the scan. Blocking: disk plus up to two HTTPS
+/// round trips. Never call from the UI thread.
 pub fn load_rate_table(cache_dir: &Path) -> RateTable {
     let cache_path = cache_dir.join(RATES_CACHE_FILE);
-    let disk = read_rates_cache(&cache_path).filter(|(_, rates)| !rates.is_empty());
+    let disk = read_rates_cache(&cache_path).filter(|(_, rates, _)| !rates.is_empty());
     let now_ms = unix_time_ms();
-    if let Some((fetched_at_ms, rates)) = &disk
+    if let Some((fetched_at_ms, rates, openrouter)) = &disk
         && now_ms.saturating_sub(*fetched_at_ms) < RATES_TTL.as_millis() as i64
     {
         return RateTable {
             rates: rates.clone(),
+            openrouter: openrouter.clone(),
             status: PricingStatus::Cached,
         };
     }
 
-    let fetched =
-        crate::usage::http_get(LITELLM_RATES_URL, &["Accept: application/json".to_owned()])
+    let fetch_json = |url: &str| {
+        crate::usage::http_get(url, &["Accept: application/json".to_owned()])
             .ok()
             .filter(|(status, _)| *status == 200)
             .and_then(|(_, body)| serde_json::from_str::<Value>(&body).ok())
-            .map(|document| parse_rate_table(&document))
-            .filter(|rates| !rates.is_empty());
+    };
+    let fetched = fetch_json(LITELLM_RATES_URL)
+        .map(|document| parse_rate_table(&document))
+        .filter(|rates| !rates.is_empty());
+    // The fallback only matters for models the official table omits, so skip
+    // the second round trip when the disk already holds it and the fetch
+    // succeeded.
+    let openrouter = match (&fetched, &disk) {
+        (Some(_), Some((_, _, openrouter))) if !openrouter.is_empty() => Some(openrouter.clone()),
+        _ => fetch_json(OPENROUTER_RATES_URL)
+            .map(|document| parse_openrouter_table(&document))
+            .filter(|rates| !rates.is_empty()),
+    };
 
-    match (fetched, disk) {
-        (Some(rates), _) => {
-            write_rates_cache(&cache_path, now_ms, &rates);
+    match (fetched, openrouter, disk) {
+        (Some(rates), openrouter, _) => {
+            write_rates_cache(
+                &cache_path,
+                now_ms,
+                &rates,
+                openrouter.as_ref().unwrap_or(&HashMap::new()),
+            );
             RateTable {
                 rates,
+                openrouter: openrouter.unwrap_or_default(),
                 status: PricingStatus::Fresh,
             }
         }
-        (None, Some((_, rates))) => RateTable {
+        (None, _, Some((_, rates, openrouter))) => RateTable {
             rates,
+            openrouter,
             status: PricingStatus::Cached,
         },
-        (None, None) => RateTable::unavailable(),
+        (None, _, None) => RateTable::unavailable(),
     }
 }
 
@@ -1111,8 +1206,8 @@ fn read_transcript_records(path: &Path, provider: UsageProvider) -> Option<Vec<U
 
 #[derive(Clone, Copy, PartialEq)]
 enum CostSource {
-    Reported,
-    Priced,
+    Official,
+    OpenRouter,
     Unpriced,
 }
 
@@ -1123,7 +1218,8 @@ struct Bucket {
     cache_savings_usd: f64,
     records: u64,
     unpriced_records: u64,
-    reported_records: u64,
+    official_records: u64,
+    openrouter_records: u64,
 }
 
 /// Per-project accumulation, keyed by the resolved project path.
@@ -1202,18 +1298,19 @@ impl Aggregator {
             return;
         }
 
-        let (cost_usd, source) = match record.reported_cost_usd {
-            Some(cost) => (cost, CostSource::Reported),
-            None => match lookup_rate(rates, &record.model) {
-                Some(rate) => (
-                    record.totals.uncached_input as f64 * rate.input
-                        + record.totals.cached_input as f64 * rate.cache_read
-                        + record.totals.cache_creation as f64 * rate.cache_creation
-                        + record.totals.output as f64 * rate.output,
-                    CostSource::Priced,
-                ),
-                None => (0.0, CostSource::Unpriced),
-            },
+        // Cost always follows the model's list price — the official table
+        // first, OpenRouter's catalog as fallback — whether the session ran on
+        // a subscription or metered billing. Provider-reported costs are
+        // deliberately ignored: they mix list and negotiated rates.
+        let (cost_usd, source) = match lookup_rate_with_source(rates, &record.model) {
+            Some((rate, source)) => (
+                record.totals.uncached_input as f64 * rate.input
+                    + record.totals.cached_input as f64 * rate.cache_read
+                    + record.totals.cache_creation as f64 * rate.cache_creation
+                    + record.totals.output as f64 * rate.output,
+                source,
+            ),
+            None => (0.0, CostSource::Unpriced),
         };
         // What the cached input would have cost at full input rates, minus
         // what it actually cost. Drives the "cache savings" figure.
@@ -1231,8 +1328,8 @@ impl Aggregator {
         bucket.records += 1;
         match source {
             CostSource::Unpriced => bucket.unpriced_records += 1,
-            CostSource::Reported => bucket.reported_records += 1,
-            CostSource::Priced => {}
+            CostSource::Official => bucket.official_records += 1,
+            CostSource::OpenRouter => bucket.openrouter_records += 1,
         }
         if !record.session_id.is_empty() {
             self.sessions
@@ -1488,7 +1585,8 @@ fn derive_history(
     let mut cache_savings_usd = 0.0;
     let mut records = 0;
     let mut unpriced_records = 0;
-    let mut reported_records = 0;
+    let mut official_records = 0;
+    let mut openrouter_records = 0;
     let mut providers: HashMap<UsageProvider, (f64, u64)> = HashMap::new();
     let mut models: HashMap<(UsageProvider, String), (f64, u64)> = HashMap::new();
     let mut daily: HashMap<NaiveDate, DaySlice> = HashMap::new();
@@ -1501,7 +1599,8 @@ fn derive_history(
         cache_savings_usd += bucket.cache_savings_usd;
         records += bucket.records;
         unpriced_records += bucket.unpriced_records;
-        reported_records += bucket.reported_records;
+        official_records += bucket.official_records;
+        openrouter_records += bucket.openrouter_records;
 
         let provider_entry = providers.entry(*provider).or_default();
         provider_entry.0 += bucket.cost_usd;
@@ -1560,13 +1659,14 @@ fn derive_history(
                 cost_usd: model_cost,
                 total_tokens: model_tokens,
                 cost_share: share(model_cost, cost_usd),
+                token_share: share(model_tokens as f64, total_tokens as f64),
             },
         )
         .collect();
     model_slices.sort_by(|a, b| {
-        b.cost_usd
-            .total_cmp(&a.cost_usd)
-            .then(b.total_tokens.cmp(&a.total_tokens))
+        b.total_tokens
+            .cmp(&a.total_tokens)
+            .then(b.cost_usd.total_cmp(&a.cost_usd))
     });
 
     let mut day_slices: Vec<DaySlice> = daily.into_values().collect();
@@ -1653,8 +1753,8 @@ fn derive_history(
         months: month_slices,
         projects: project_slices,
         quality: CostQuality {
-            provider_reported_share: record_share(reported_records),
-            model_priced_share: record_share(records - reported_records - unpriced_records),
+            official_priced_share: record_share(official_records),
+            openrouter_priced_share: record_share(openrouter_records),
             unpriced_share: record_share(unpriced_records),
             cache_savings_usd,
         },
@@ -1718,6 +1818,7 @@ mod tests {
                 .iter()
                 .map(|(name, rate)| ((*name).to_owned(), *rate))
                 .collect(),
+            openrouter: HashMap::new(),
             status: PricingStatus::Fresh,
         }
     }
@@ -1798,7 +1899,6 @@ mod tests {
         assert_eq!(record.session_id, "session-1");
         assert_eq!(record.project, "/Users/me/dev/waku");
         assert_eq!(record.dedupe_key.as_deref(), Some("msg_1:req_1"));
-        assert_eq!(record.reported_cost_usd, None);
         assert_eq!(record.totals.uncached_input, 2);
         assert_eq!(record.totals.cache_creation, 50700);
         assert_eq!(record.totals.output, 1238);
@@ -1988,7 +2088,6 @@ mod tests {
                 output: 500,
                 reasoning: 0,
             },
-            reported_cost_usd: None,
             dedupe_key: Some("msg:req".to_owned()),
         };
         let today = Local::now().date_naive();
@@ -2019,7 +2118,7 @@ mod tests {
         assert!((history.quality.cache_savings_usd - expected_savings).abs() < 1e-9);
         assert_eq!(history.daily.len(), 1);
         assert_eq!(history.providers.len(), 1);
-        assert!((history.quality.model_priced_share - 1.0).abs() < f64::EPSILON);
+        assert!((history.quality.official_priced_share - 1.0).abs() < f64::EPSILON);
 
         // The subdirectory cwd resolved to its containing project root, and
         // the month fold carries the same totals as the single active day.
@@ -2061,7 +2160,6 @@ mod tests {
                 uncached_input: 100,
                 ..TokenTotals::default()
             },
-            reported_cost_usd: None,
             dedupe_key: None,
         };
         aggregator.add(&record(0, "session-now", "/a"), &rates);
@@ -2107,7 +2205,6 @@ mod tests {
                 uncached_input: 100,
                 ..TokenTotals::default()
             },
-            reported_cost_usd: None,
             dedupe_key: None,
         };
         aggregator.add(&record, &rates);
@@ -2167,12 +2264,52 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("waku-usage-rates-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(RATES_CACHE_FILE);
-        write_rates_cache(&path, 12345, &rates);
-        let (fetched_at_ms, restored) = read_rates_cache(&path).expect("cache round-trips");
+        write_rates_cache(&path, 12345, &rates, &HashMap::new());
+        let (fetched_at_ms, restored, openrouter) = read_rates_cache(&path).expect("cache round-trips");
         assert_eq!(fetched_at_ms, 12345);
         assert_eq!(restored.len(), rates.len());
         assert_eq!(restored["claude-fable-5"], rates["claude-fable-5"]);
+        assert!(openrouter.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn openrouter_catalog_prices_the_official_fallback() {
+        let document: Value = serde_json::from_str(
+            r#"{
+                "data": [
+                    {"id": "openai/gpt-5.3-codex", "pricing": {"prompt": "0.000003",
+                        "completion": "0.000009", "input_cache_read": "0.0000003"}},
+                    {"id": "moonshotai/kimi-k2.5", "pricing": {"prompt": "0.000002",
+                        "completion": "0.000008", "input_cache_write": "0.000004"}},
+                    {"id": "free-variant:free", "pricing": {"prompt": "0", "completion": "0"}},
+                    {"id": "half-priced", "pricing": {"prompt": "0.000001"}},
+                    {"id": "no-pricing"},
+                    {"pricing": {"prompt": "1", "completion": "2"}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let rates = parse_openrouter_table(&document);
+        assert_eq!(rates.len(), 3, "unusable entries are dropped");
+        let codex = &rates["gpt-5.3-codex"];
+        assert_eq!(codex.input, 3e-6);
+        assert_eq!(codex.output, 9e-6);
+        // The catalog's explicit cache-read rate survives; the write rate
+        // falls back to the plain input rate, not to free.
+        assert_eq!(codex.cache_read, 3e-7);
+        assert_eq!(codex.cache_creation, 3e-6);
+        assert_eq!(rates["kimi-k2.5"].cache_creation, 4e-6);
+
+        // The lookup prefers official rates and only then OpenRouter's.
+        let mut table = rate_table(&[("claude-fable-5", FLAT_RATE)]);
+        table.openrouter = rates;
+        assert_eq!(
+            lookup_rate(&table, "anthropic/claude-fable-5").unwrap().input,
+            1e-6,
+            "official pricing wins"
+        );
+        assert_eq!(lookup_rate(&table, "openai/gpt-5.3-codex").unwrap().input, 3e-6);
     }
 
     #[test]
@@ -2226,7 +2363,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_lines_parse_usage_model_and_reported_cost() {
+    fn pi_lines_parse_usage_model_and_dedupe_key() {
         // Shapes captured from live ~/.omp and ~/.pi session transcripts: the
         // two CLIs share one message format but not the `model_change` fields.
         let session = r#"{"type":"session","version":3,"id":"019fe6b1-835b-7000-9fb4-252c89d32281","timestamp":"2026-08-09T13:23:41.019Z","cwd":"/Users/me/dev/waku"}"#;
@@ -2246,7 +2383,6 @@ mod tests {
         assert_eq!(record.totals.cache_creation, 0);
         assert_eq!(record.totals.output, 198);
         assert_eq!(record.totals.reasoning, 83);
-        assert!((record.reported_cost_usd.unwrap() - 0.002936772).abs() < 1e-12);
         assert_eq!(record.dedupe_key.as_deref(), Some("pi:7f49a50f"));
 
         // A user line and a usage-less assistant line parse to nothing.
@@ -2280,7 +2416,6 @@ mod tests {
         .expect("the fallback model attributes the record");
         assert_eq!(bare.provider, UsageProvider::OhMyPi);
         assert_eq!(bare.model, "ollama-cloud/glm-5.2");
-        assert!(bare.reported_cost_usd.is_none());
 
         // Pi's own split shape, captured from a live ~/.pi transcript.
         let mut pi_state = PiScanState::new();
@@ -2430,7 +2565,6 @@ mod tests {
         assert_eq!(record.totals.uncached_input, 11838);
         assert_eq!(record.totals.output, 80);
         assert_eq!(record.totals.total(), 11918);
-        assert!(record.reported_cost_usd.is_none());
         assert_eq!(
             record.dedupe_key.as_deref(),
             Some("dsh:session-cf88fef4-768c-490d-9dd9-6b72fa7e696c:15")

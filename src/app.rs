@@ -1164,6 +1164,9 @@ pub struct Waku {
     usage_window: crate::usage_history::UsageWindow,
     usage_metric: UsageMetric,
     usage_breakdown: UsageBreakdown,
+    /// How the breakdown's model table ranks: false by tokens (the share
+    /// column then shows token share), true by cost.
+    usage_model_sort_by_cost: bool,
     /// Scroll position of the monthly statement card, which scrolls
     /// internally like the projects card so the two list views feel alike.
     usage_months_scroll: ScrollHandle,
@@ -2791,9 +2794,10 @@ impl Waku {
                 usage_history_generation: 0,
                 usage_history_scanned_at: None,
                 usage_view: UsageViewMode::Daily,
-                usage_window: crate::usage_history::UsageWindow::TrailingDays(30),
-                usage_metric: UsageMetric::Cost,
+                usage_window: crate::usage_history::UsageWindow::TrailingDays(7),
+                usage_metric: UsageMetric::Tokens,
                 usage_breakdown: UsageBreakdown::Model,
+                usage_model_sort_by_cost: false,
                 usage_months_scroll: ScrollHandle::new(),
                 usage_months_scrollbar: ScrollbarState::new(),
                 usage_project_filter,

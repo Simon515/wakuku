@@ -1034,8 +1034,8 @@ usage.share: 割合
 usage.tokens: トークン
 usage.day: 日付
 usage.cost_quality: コストの信頼度
-usage.provider_reported: プロバイダー報告値
-usage.model_priced: モデル料金から算出
+usage.official_priced: 公式料金
+usage.openrouter_priced: OpenRouter 料金
 usage.unpriced: 未算出
 usage.no_activity_12_months: 過去 12 か月間のアクティビティはありません
 usage.last_12_months: 過去 12 か月

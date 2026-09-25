@@ -1035,6 +1035,49 @@ impl Waku {
             );
         }
 
+        // Ranking switch for the model table: tokens by default, cost as
+        // the alternative. Only meaningful while models are shown.
+        let mut sort_toggle = div()
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .flex()
+            .overflow_hidden();
+        for (by_cost, label) in [
+            (false, tr!("usage.tokens_upper")),
+            (true, tr!("usage.cost_upper")),
+        ] {
+            let selected = self.usage_model_sort_by_cost == by_cost;
+            sort_toggle = sort_toggle.child(
+                div()
+                    .id(SharedString::from(format!("usage-sort-{label}")))
+                    .tab_index(0)
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .h(px(22.0))
+                    .px(px(9.0))
+                    .flex()
+                    .items_center()
+                    .cursor_default()
+                    .text_size(sp(12.5))
+                    .text_color(if selected {
+                        theme.text
+                    } else {
+                        theme.text_secondary
+                    })
+                    .when(selected, |element| element.bg(theme.overlay))
+                    .when(!selected, |element| {
+                        element.hover(|element| element.text_color(theme.text))
+                    })
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.usage_model_sort_by_cost != by_cost {
+                            this.usage_model_sort_by_cost = by_cost;
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+
         div()
             .flex_1()
             .min_w(px(0.0))
@@ -1054,10 +1097,15 @@ impl Waku {
                             .text_color(theme.text)
                             .child(tr!("usage.breakdown")),
                     )
+                    .when(breakdown == UsageBreakdown::Model, |element| {
+                        element.child(sort_toggle)
+                    })
                     .child(toggle),
             )
             .child(match breakdown {
-                UsageBreakdown::Model => usage_model_table(history, theme),
+                UsageBreakdown::Model => {
+                    usage_model_table(history, self.usage_model_sort_by_cost, theme)
+                }
                 UsageBreakdown::Day => usage_day_table(history, theme),
             })
     }
@@ -1738,8 +1786,17 @@ fn usage_cell(width: f32, text: String, color: Hsla) -> Div {
         .child(SharedString::from(text))
 }
 
-/// Per-model costs, largest first.
-fn usage_model_table(history: &UsageHistory, theme: &Theme) -> Div {
+/// Per-model usage. Default ranking is by token volume with the token share;
+/// a toggle re-ranks by cost, and the share follows the active ranking.
+fn usage_model_table(history: &UsageHistory, by_cost: bool, theme: &Theme) -> Div {
+    let mut models = history.models.clone();
+    if by_cost {
+        models.sort_by(|a, b| {
+            b.cost_usd
+                .total_cmp(&a.cost_usd)
+                .then(b.total_tokens.cmp(&a.total_tokens))
+        });
+    }
     let mut table = div().flex().flex_col().text_size(sp(12.5)).child(
         div()
             .pb(px(7.0))
@@ -1751,14 +1808,14 @@ fn usage_model_table(history: &UsageHistory, theme: &Theme) -> Div {
             .text_size(sp(12.5))
             .text_color(theme.text_tertiary)
             .child(div().flex_1().min_w_0().child(tr!("usage.model")))
-            .child(usage_cell(84.0, tr!("usage.cost"), theme.text_tertiary))
+            .child(usage_cell(84.0, tr!("usage.tokens"), theme.text_tertiary))
             .child(usage_cell(64.0, tr!("usage.share"), theme.text_tertiary))
-            .child(usage_cell(84.0, tr!("usage.tokens"), theme.text_tertiary)),
+            .child(usage_cell(84.0, tr!("usage.cost"), theme.text_tertiary)),
     );
-    if history.models.is_empty() {
+    if models.is_empty() {
         return table.child(usage_table_empty_row(theme));
     }
-    for model in &history.models {
+    for model in &models {
         let kind = provider_kind(model.provider);
         table = table.child(
             div()
@@ -1789,17 +1846,21 @@ fn usage_model_table(history: &UsageHistory, theme: &Theme) -> Div {
                                 .child(SharedString::from(model.model.clone())),
                         ),
                 )
-                .child(usage_cell(84.0, format_usd(model.cost_usd), theme.text))
-                .child(usage_cell(
-                    64.0,
-                    format_percent(model.cost_share),
-                    theme.text_tertiary,
-                ))
                 .child(usage_cell(
                     84.0,
                     format_tokens_compact(model.total_tokens as f64),
+                    theme.text,
+                ))
+                .child(usage_cell(
+                    64.0,
+                    format_percent(if by_cost {
+                        model.cost_share
+                    } else {
+                        model.token_share
+                    }),
                     theme.text_tertiary,
-                )),
+                ))
+                .child(usage_cell(84.0, format_usd(model.cost_usd), theme.text_tertiary)),
         );
     }
     table
@@ -1905,12 +1966,12 @@ fn usage_quality_panel(history: &UsageHistory, theme: &Theme) -> Div {
                 .flex()
                 .flex_col()
                 .child(row(
-                    tr!("usage.provider_reported"),
-                    format_percent(history.quality.provider_reported_share),
+                    tr!("usage.official_priced"),
+                    format_percent(history.quality.official_priced_share),
                 ))
                 .child(row(
-                    tr!("usage.model_priced"),
-                    format_percent(history.quality.model_priced_share),
+                    tr!("usage.openrouter_priced"),
+                    format_percent(history.quality.openrouter_priced_share),
                 ))
                 .child(row(
                     tr!("usage.unpriced"),

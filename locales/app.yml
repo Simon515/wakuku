@@ -2035,10 +2035,10 @@ usage.day:
   en: Day
 usage.cost_quality:
   en: Cost quality
-usage.provider_reported:
-  en: Provider reported
-usage.model_priced:
-  en: Model priced
+usage.official_priced:
+  en: Official rate
+usage.openrouter_priced:
+  en: OpenRouter rate
 usage.unpriced:
   en: Unpriced
 usage.no_activity_12_months:
