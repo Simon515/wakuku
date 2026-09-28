@@ -55,6 +55,7 @@ use crate::browser::BrowserView;
 use crate::persistence::{
     ComposerDraftStore, ComposerDrafts, DEFAULT_RIGHT_PANEL_WIDTH, DEFAULT_SIDEBAR_WIDTH,
     PersistedState, PersistedWindowState, SidebarGrouping, SidebarOrdering, StateStore,
+    ThinkingDisplay,
 };
 use crate::query::{Query, QueryCache};
 use crate::review_diff::{Snapshot as ReviewDiffSnapshot, Source as ReviewDiffSource};
@@ -1163,6 +1164,9 @@ pub struct Waku {
     usage_window: crate::usage_history::UsageWindow,
     usage_metric: UsageMetric,
     usage_breakdown: UsageBreakdown,
+    /// How the breakdown's model table ranks: false by tokens (the share
+    /// column then shows token share), true by cost.
+    usage_model_sort_by_cost: bool,
     /// Scroll position of the monthly statement card, which scrolls
     /// internally like the projects card so the two list views feel alike.
     usage_months_scroll: ScrollHandle,
@@ -1307,6 +1311,10 @@ pub struct Waku {
     /// Per-item disclosure overrides. Reasoning starts open while live; tool
     /// details start closed, so the stored bool must preserve either choice.
     expanded_activity_items: HashMap<Uuid, bool>,
+    /// Reasoning previews opened to their full content in the current session.
+    reasoning_previews_expanded: HashSet<Uuid>,
+    /// Cached settled reasoning previews, keyed by activity content identity.
+    reasoning_preview_cache: RefCell<HashMap<Uuid, (usize, usize, Rc<str>, bool)>>,
     /// Settled turns whose folded work the user has reopened.
     expanded_turns: HashSet<Uuid>,
     /// Per-response file cards the user expanded beyond their three-file
@@ -2786,9 +2794,10 @@ impl Waku {
                 usage_history_generation: 0,
                 usage_history_scanned_at: None,
                 usage_view: UsageViewMode::Daily,
-                usage_window: crate::usage_history::UsageWindow::TrailingDays(30),
-                usage_metric: UsageMetric::Cost,
+                usage_window: crate::usage_history::UsageWindow::TrailingDays(7),
+                usage_metric: UsageMetric::Tokens,
                 usage_breakdown: UsageBreakdown::Model,
+                usage_model_sort_by_cost: false,
                 usage_months_scroll: ScrollHandle::new(),
                 usage_months_scrollbar: ScrollbarState::new(),
                 usage_project_filter,
@@ -2852,6 +2861,8 @@ impl Waku {
                 last_stream_save: Instant::now(),
                 activities_expanded: HashMap::new(),
                 expanded_activity_items: HashMap::new(),
+                reasoning_previews_expanded: HashSet::new(),
+                reasoning_preview_cache: RefCell::new(HashMap::new()),
                 expanded_turns: HashSet::new(),
                 expanded_changed_files: HashSet::new(),
                 transcript_control_focuses: RefCell::new(HashMap::new()),

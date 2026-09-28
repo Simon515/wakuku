@@ -32,6 +32,28 @@ fn provider_kind(provider: UsageProvider) -> ProviderKind {
     match provider {
         UsageProvider::Claude => ProviderKind::Claude,
         UsageProvider::Codex => ProviderKind::Codex,
+        UsageProvider::DeepSeek => ProviderKind::DeepSeek,
+        UsageProvider::Kimi => ProviderKind::Kimi,
+        UsageProvider::OhMyPi => ProviderKind::OhMyPi,
+        UsageProvider::Pi => ProviderKind::Pi,
+    }
+}
+
+/// The hue a provider is drawn with across this page.
+///
+/// Brand marks are mostly neutral (`provider_color`), which cannot tell four
+/// separate providers apart on one chart, so the usage page assigns every
+/// provider an unambiguous hue: the brand colour where one exists (Claude,
+/// DeepSeek, and Codex's neutral) and a distinct hue for the ones that share
+/// the neutral mark.
+fn usage_chart_color(theme: &Theme, provider: UsageProvider) -> Hsla {
+    match provider {
+        UsageProvider::Claude => rgb(0xD97757).into(),
+        UsageProvider::DeepSeek => rgb(0x4D6BFE).into(),
+        UsageProvider::Kimi => rgb(0x8B5CF6).into(),
+        UsageProvider::OhMyPi => rgb(0x10B981).into(),
+        UsageProvider::Pi => rgb(0x0EA5E9).into(),
+        UsageProvider::Codex => provider_color(theme, ProviderKind::Codex),
     }
 }
 
@@ -475,7 +497,7 @@ impl Waku {
         }
         for provider in &providers {
             let kind = provider_kind(provider.provider);
-            let color = provider_color(theme, kind);
+            let color = usage_chart_color(theme, provider.provider);
             let share = match metric {
                 UsageMetric::Cost => provider.cost_share,
                 UsageMetric::Tokens => provider.token_share,
@@ -607,7 +629,7 @@ impl Waku {
         }
 
         let mut legend = div().flex().items_center().gap(px(14.0));
-        for provider in UsageProvider::ALL {
+        for provider in usage_charted_providers(history) {
             let kind = provider_kind(provider);
             legend = legend.child(
                 div()
@@ -618,7 +640,7 @@ impl Waku {
                         theme,
                         kind,
                         12.0,
-                        provider_color(theme, kind),
+                        usage_chart_color(theme, provider),
                     ))
                     .child(
                         div()
@@ -700,10 +722,12 @@ impl Waku {
     ) -> Div {
         let metric = self.usage_metric;
         let day_count = days.len();
-        // One column per day, per provider in ALL order. The chart paths and
-        // the hover readout both consume this, so the number under the cursor
-        // is by construction the number that was plotted.
-        let series: Vec<[f64; 2]> = days
+        // One column per day, one band per provider the window used, in
+        // `charted` order. The chart paths and the hover readout both consume
+        // this, so the number under the cursor is by construction the number
+        // that was plotted.
+        let charted = usage_charted_providers(history);
+        let series: Vec<Vec<f64>> = days
             .iter()
             .map(|day| {
                 let slice = history.day(*day);
@@ -718,7 +742,7 @@ impl Waku {
                         })
                         .unwrap_or(0.0)
                 };
-                [value(UsageProvider::Claude), value(UsageProvider::Codex)]
+                charted.iter().map(|provider| value(*provider)).collect()
             })
             .collect();
         // The scale tops out at the largest single provider-day, not the
@@ -765,10 +789,10 @@ impl Waku {
         }
 
         let hover = self.usage_chart_hover.filter(|index| *index < day_count);
-        let colors = [
-            provider_color(theme, ProviderKind::Claude),
-            provider_color(theme, ProviderKind::Codex),
-        ];
+        let colors: Vec<Hsla> = charted
+            .iter()
+            .map(|provider| usage_chart_color(theme, *provider))
+            .collect();
         let bounds_cell = self.usage_chart_bounds.clone();
         let paint_series = series.clone();
         let paint_ticks = ticks.clone();
@@ -1011,6 +1035,49 @@ impl Waku {
             );
         }
 
+        // Ranking switch for the model table: tokens by default, cost as
+        // the alternative. Only meaningful while models are shown.
+        let mut sort_toggle = div()
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .flex()
+            .overflow_hidden();
+        for (by_cost, label) in [
+            (false, tr!("usage.tokens_upper")),
+            (true, tr!("usage.cost_upper")),
+        ] {
+            let selected = self.usage_model_sort_by_cost == by_cost;
+            sort_toggle = sort_toggle.child(
+                div()
+                    .id(SharedString::from(format!("usage-sort-{label}")))
+                    .tab_index(0)
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .h(px(22.0))
+                    .px(px(9.0))
+                    .flex()
+                    .items_center()
+                    .cursor_default()
+                    .text_size(sp(12.5))
+                    .text_color(if selected {
+                        theme.text
+                    } else {
+                        theme.text_secondary
+                    })
+                    .when(selected, |element| element.bg(theme.overlay))
+                    .when(!selected, |element| {
+                        element.hover(|element| element.text_color(theme.text))
+                    })
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.usage_model_sort_by_cost != by_cost {
+                            this.usage_model_sort_by_cost = by_cost;
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+
         div()
             .flex_1()
             .min_w(px(0.0))
@@ -1030,10 +1097,15 @@ impl Waku {
                             .text_color(theme.text)
                             .child(tr!("usage.breakdown")),
                     )
+                    .when(breakdown == UsageBreakdown::Model, |element| {
+                        element.child(sort_toggle)
+                    })
                     .child(toggle),
             )
             .child(match breakdown {
-                UsageBreakdown::Model => usage_model_table(history, theme),
+                UsageBreakdown::Model => {
+                    usage_model_table(history, self.usage_model_sort_by_cost, theme)
+                }
                 UsageBreakdown::Day => usage_day_table(history, theme),
             })
     }
@@ -1527,7 +1599,7 @@ fn usage_chart_readout(
                 .child(SharedString::from(format_day_short(day))),
         );
     let mut total = 0.0;
-    for provider in UsageProvider::ALL {
+    for provider in usage_charted_providers(history) {
         let kind = provider_kind(provider);
         let amount = value(provider);
         total += amount;
@@ -1540,7 +1612,7 @@ fn usage_chart_readout(
                     theme,
                     kind,
                     11.0,
-                    provider_color(theme, kind),
+                    usage_chart_color(theme, provider),
                 ))
                 .child(
                     div()
@@ -1714,8 +1786,17 @@ fn usage_cell(width: f32, text: String, color: Hsla) -> Div {
         .child(SharedString::from(text))
 }
 
-/// Per-model costs, largest first.
-fn usage_model_table(history: &UsageHistory, theme: &Theme) -> Div {
+/// Per-model usage. Default ranking is by token volume with the token share;
+/// a toggle re-ranks by cost, and the share follows the active ranking.
+fn usage_model_table(history: &UsageHistory, by_cost: bool, theme: &Theme) -> Div {
+    let mut models = history.models.clone();
+    if by_cost {
+        models.sort_by(|a, b| {
+            b.cost_usd
+                .total_cmp(&a.cost_usd)
+                .then(b.total_tokens.cmp(&a.total_tokens))
+        });
+    }
     let mut table = div().flex().flex_col().text_size(sp(12.5)).child(
         div()
             .pb(px(7.0))
@@ -1727,14 +1808,14 @@ fn usage_model_table(history: &UsageHistory, theme: &Theme) -> Div {
             .text_size(sp(12.5))
             .text_color(theme.text_tertiary)
             .child(div().flex_1().min_w_0().child(tr!("usage.model")))
-            .child(usage_cell(84.0, tr!("usage.cost"), theme.text_tertiary))
+            .child(usage_cell(84.0, tr!("usage.tokens"), theme.text_tertiary))
             .child(usage_cell(64.0, tr!("usage.share"), theme.text_tertiary))
-            .child(usage_cell(84.0, tr!("usage.tokens"), theme.text_tertiary)),
+            .child(usage_cell(84.0, tr!("usage.cost"), theme.text_tertiary)),
     );
-    if history.models.is_empty() {
+    if models.is_empty() {
         return table.child(usage_table_empty_row(theme));
     }
-    for model in &history.models {
+    for model in &models {
         let kind = provider_kind(model.provider);
         table = table.child(
             div()
@@ -1755,7 +1836,7 @@ fn usage_model_table(history: &UsageHistory, theme: &Theme) -> Div {
                             theme,
                             kind,
                             12.0,
-                            provider_color(theme, kind),
+                            usage_chart_color(theme, model.provider),
                         ))
                         .child(
                             div()
@@ -1765,24 +1846,30 @@ fn usage_model_table(history: &UsageHistory, theme: &Theme) -> Div {
                                 .child(SharedString::from(model.model.clone())),
                         ),
                 )
-                .child(usage_cell(84.0, format_usd(model.cost_usd), theme.text))
-                .child(usage_cell(
-                    64.0,
-                    format_percent(model.cost_share),
-                    theme.text_tertiary,
-                ))
                 .child(usage_cell(
                     84.0,
                     format_tokens_compact(model.total_tokens as f64),
+                    theme.text,
+                ))
+                .child(usage_cell(
+                    64.0,
+                    format_percent(if by_cost {
+                        model.cost_share
+                    } else {
+                        model.token_share
+                    }),
                     theme.text_tertiary,
-                )),
+                ))
+                .child(usage_cell(84.0, format_usd(model.cost_usd), theme.text_tertiary)),
         );
     }
     table
 }
 
-/// The most recent active days, newest first, with per-provider cost columns.
+/// The most recent active days, newest first, with a cost column per provider
+/// the window used.
 fn usage_day_table(history: &UsageHistory, theme: &Theme) -> Div {
+    let charted = usage_charted_providers(history);
     let mut header = div()
         .pb(px(7.0))
         .border_b_1()
@@ -1793,7 +1880,7 @@ fn usage_day_table(history: &UsageHistory, theme: &Theme) -> Div {
         .text_size(sp(12.5))
         .text_color(theme.text_tertiary)
         .child(div().flex_1().min_w_0().child(tr!("usage.day")));
-    for provider in UsageProvider::ALL {
+    for provider in &charted {
         header = header.child(usage_cell(
             84.0,
             provider.label().to_owned(),
@@ -1823,7 +1910,7 @@ fn usage_day_table(history: &UsageHistory, theme: &Theme) -> Div {
                     .text_color(theme.text)
                     .child(SharedString::from(format_day_short(day.day))),
             );
-        for provider in UsageProvider::ALL {
+        for provider in &charted {
             row = row.child(usage_cell(
                 84.0,
                 format_usd(day.by_provider[provider.index()].cost_usd),
@@ -1879,12 +1966,12 @@ fn usage_quality_panel(history: &UsageHistory, theme: &Theme) -> Div {
                 .flex()
                 .flex_col()
                 .child(row(
-                    tr!("usage.provider_reported"),
-                    format_percent(history.quality.provider_reported_share),
+                    tr!("usage.official_priced"),
+                    format_percent(history.quality.official_priced_share),
                 ))
                 .child(row(
-                    tr!("usage.model_priced"),
-                    format_percent(history.quality.model_priced_share),
+                    tr!("usage.openrouter_priced"),
+                    format_percent(history.quality.openrouter_priced_share),
                 ))
                 .child(row(
                     tr!("usage.unpriced"),
@@ -2075,11 +2162,21 @@ fn rank_by_cost(history: &UsageHistory) -> bool {
     history.cost_usd > 0.0
 }
 
-fn usage_provider_colors(theme: &Theme) -> [Hsla; 2] {
-    [
-        provider_color(theme, ProviderKind::Claude),
-        provider_color(theme, ProviderKind::Codex),
-    ]
+/// The providers the window actually used, heaviest first — the ones the
+/// chart, its legend, and its readout plot. Providers with no usage would only
+/// add flat zero lines and empty legend chips.
+fn usage_charted_providers(history: &UsageHistory) -> Vec<UsageProvider> {
+    history
+        .providers
+        .iter()
+        .map(|slice| slice.provider)
+        .collect()
+}
+
+/// Every provider's hue in `UsageProvider::ALL` order, indexed the same way
+/// the `by_provider` lanes are.
+fn usage_provider_colors(theme: &Theme) -> [Hsla; UsageProvider::COUNT] {
+    UsageProvider::ALL.map(|provider| usage_chart_color(theme, provider))
 }
 
 /// The period total in the ranking unit.
@@ -2156,16 +2253,15 @@ fn usage_list_empty_row(theme: &Theme, message: String) -> Div {
 /// one glance carries both size and mix.
 fn usage_split_bar(
     theme: &Theme,
-    colors: [Hsla; 2],
+    colors: [Hsla; UsageProvider::COUNT],
     length: f32,
-    by_provider: &[ProviderDay; 2],
+    by_provider: &[ProviderDay; UsageProvider::COUNT],
     by_cost: bool,
 ) -> Div {
-    let values = [
-        usage_provider_value(&by_provider[0], by_cost),
-        usage_provider_value(&by_provider[1], by_cost),
-    ];
-    let sum = values[0] + values[1];
+    let sum: f64 = UsageProvider::ALL
+        .iter()
+        .map(|provider| usage_provider_value(&by_provider[provider.index()], by_cost))
+        .sum();
     let length = if length > 0.0 {
         length.clamp(0.02, 1.0)
     } else {
@@ -2178,15 +2274,17 @@ fn usage_split_bar(
         .overflow_hidden()
         .flex();
     if sum > 0.0 {
-        for (index, value) in values.into_iter().enumerate() {
-            if value > 0.0 {
-                bar = bar.child(
-                    div()
-                        .h_full()
-                        .w(relative((value / sum) as f32))
-                        .bg(colors[index]),
-                );
+        for provider in UsageProvider::ALL {
+            let value = usage_provider_value(&by_provider[provider.index()], by_cost);
+            if value <= 0.0 {
+                continue;
             }
+            bar = bar.child(
+                div()
+                    .h_full()
+                    .w(relative((value / sum) as f32))
+                    .bg(colors[provider.index()]),
+            );
         }
     }
     div()
@@ -2207,7 +2305,11 @@ fn usage_provider_value(entry: &ProviderDay, by_cost: bool) -> f64 {
 
 /// Per-provider amounts with their marks, skipping providers absent from
 /// the row.
-fn usage_provider_values(theme: &Theme, by_provider: &[ProviderDay; 2], by_cost: bool) -> Div {
+fn usage_provider_values(
+    theme: &Theme,
+    by_provider: &[ProviderDay; UsageProvider::COUNT],
+    by_cost: bool,
+) -> Div {
     let mut row = div().flex().items_center().gap(px(14.0));
     for provider in UsageProvider::ALL {
         let entry = by_provider[provider.index()];
@@ -2224,7 +2326,7 @@ fn usage_provider_values(theme: &Theme, by_provider: &[ProviderDay; 2], by_cost:
                     theme,
                     kind,
                     11.0,
-                    provider_color(theme, kind),
+                    usage_chart_color(theme, provider),
                 ))
                 .child(
                     div()
@@ -2338,21 +2440,20 @@ fn usage_month_strip(
     first_day: NaiveDate,
     peak: f64,
     by_cost: bool,
-    colors: [Hsla; 2],
+    colors: [Hsla; UsageProvider::COUNT],
 ) -> impl IntoElement {
     let day_count = usage_history::days_in_month(first_day);
-    let values: Vec<[f64; 2]> = (0..day_count)
+    let values: Vec<[f64; UsageProvider::COUNT]> = (0..day_count)
         .map(|offset| {
             let day = first_day + chrono::Days::new(u64::from(offset));
             history
                 .day(day)
                 .map(|slice| {
-                    [
-                        usage_provider_value(&slice.by_provider[0], by_cost),
-                        usage_provider_value(&slice.by_provider[1], by_cost),
-                    ]
+                    UsageProvider::ALL.map(|provider| {
+                        usage_provider_value(&slice.by_provider[provider.index()], by_cost)
+                    })
                 })
-                .unwrap_or([0.0, 0.0])
+                .unwrap_or([0.0; UsageProvider::COUNT])
         })
         .collect();
     canvas(
@@ -2516,7 +2617,7 @@ fn usage_month_row(
     history: &UsageHistory,
     month: &MonthSlice,
     theme: &Theme,
-    colors: [Hsla; 2],
+    colors: [Hsla; UsageProvider::COUNT],
     by_cost: bool,
     peak: f64,
     day_peak: f64,

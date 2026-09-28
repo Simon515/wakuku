@@ -1,9 +1,13 @@
 //! Historical token and cost usage for the settings Usage page, scanned from
-//! the provider CLIs' own on-disk session transcripts (Claude Code's
-//! `~/.claude/projects` and Codex's `~/.codex/sessions`) the way T3 Code and
-//! `ccusage` do it, so usage covers turns driven outside Waku too. Costs are
-//! priced against LiteLLM's model rate table, fetched at most daily and cached
-//! beside the app database.
+//! the provider CLIs' own on-disk session transcripts the way T3 Code and
+//! `ccusage` do it, so usage covers turns driven outside Waku too: Claude
+//! Code's `~/.claude/projects`, Codex's `~/.codex/sessions`, the Pi agent
+//! session format shared by Pi's `~/.pi/agent/sessions` and Oh My Pi's
+//! `~/.omp/agent/sessions`, Kimi Code's `~/.kimi-code/sessions` (plus the
+//! pre-migration `~/.kimi/sessions`, which uses an older record shape), and
+//! DeepSeek Harness's zstd-compressed `~/.dsh/sessions`. Costs are priced against
+//! LiteLLM's model rate table, fetched at most daily and cached beside the
+//! app database.
 //!
 //! Everything here blocks on the filesystem and (for the rate table) the
 //! network, and must run on the background executor. Render reads only the
@@ -17,7 +21,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike as _, Local, NaiveDate, TimeZone as _, Utc};
+use md5::Digest as _;
 use serde_json::Value;
+
+use crate::model::ProviderKind;
 
 pub use waku_protocol::usage_history::{
     CostQuality, DaySlice, MONTHLY_WINDOW, ModelSlice, MonthSlice, PricingStatus, ProjectSlice,
@@ -32,6 +39,9 @@ const MTIME_SLACK: Duration = Duration::from_secs(36 * 3600);
 
 const LITELLM_RATES_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+/// Fallback for models the LiteLLM table prices incompletely: OpenRouter's
+/// public catalog carries per-token pricing for its own routing catalog.
+const OPENROUTER_RATES_URL: &str = "https://openrouter.ai/api/v1/models";
 const RATES_CACHE_FILE: &str = "usage-model-rates.json";
 /// Rates move rarely; a day-old table keeps the page working offline.
 const RATES_TTL: Duration = Duration::from_secs(24 * 3600);
@@ -48,7 +58,6 @@ pub struct UsageRecord {
     /// not say.
     pub project: String,
     pub totals: TokenTotals,
-    pub reported_cost_usd: Option<f64>,
     /// Key for cross-file de-duplication, or `None` when the record is
     /// inherently unique and needs no dedup.
     pub dedupe_key: Option<String>,
@@ -61,6 +70,31 @@ fn might_carry_usage(line: &str, provider: UsageProvider) -> bool {
     match provider {
         UsageProvider::Claude => line.contains("\"usage\""),
         UsageProvider::Codex => line.contains("\"token_count\""),
+        // Both Kimi shapes carry usage on a line naming it; the modern
+        // `usage.record` and the older `StatusUpdate`'s `token_usage`.
+        UsageProvider::Kimi => {
+            line.contains("\"token_usage\"") || line.contains("\"usage.record\"")
+        }
+        UsageProvider::DeepSeek => line.contains("\"inputTokens\""),
+        // The Pi agent session format, shared by Pi and Oh My Pi.
+        UsageProvider::OhMyPi | UsageProvider::Pi => line.contains("\"usage\""),
+    }
+}
+
+/// Lines that carry no usage themselves but advance a parser's rolling
+/// session state (identity, working directory, or model).
+fn carries_scan_context(line: &str, provider: UsageProvider) -> bool {
+    match provider {
+        UsageProvider::Codex => {
+            line.contains("\"turn_context\"") || line.contains("\"session_meta\"")
+        }
+        UsageProvider::OhMyPi | UsageProvider::Pi => {
+            line.contains("\"type\":\"session\"") || line.contains("\"model_change\"")
+        }
+        UsageProvider::DeepSeek => {
+            line.contains("\"type\":\"session\"") || line.contains("\"request/header\"")
+        }
+        UsageProvider::Claude | UsageProvider::Kimi => false,
     }
 }
 
@@ -133,10 +167,7 @@ fn parse_claude_line(line: &str) -> Option<UsageRecord> {
             // Anthropic folds thinking tokens into output without a breakout.
             reasoning: 0,
         },
-        reported_cost_usd: record
-            .get("costUSD")
-            .and_then(Value::as_f64)
-            .filter(|cost| cost.is_finite()),
+
         dedupe_key,
     })
 }
@@ -347,11 +378,303 @@ fn parse_codex_line(line: &str, state: &mut CodexScanState) -> Option<UsageRecor
         session_id: state.session_id.clone(),
         project: state.cwd.clone(),
         totals,
-        // Codex does not report cost in the rollout.
-        reported_cost_usd: None,
         // Fork copies were suppressed while parsing the physical rollout, so
         // surviving events are unique and need no global deduplication.
         dedupe_key: None,
+    })
+}
+
+/// Rolling state for a Pi-agent session transcript. Pi and Oh My Pi share the
+/// format: a leading `session` line carries identity and the working
+/// directory, `model_change` lines carry the active model forward for usage
+/// records that lack one — the two CLIs disagree only on how `model_change`
+/// spells that model.
+struct PiScanState {
+    session_id: String,
+    cwd: String,
+    fallback_model: String,
+}
+
+impl PiScanState {
+    fn new() -> Self {
+        Self {
+            session_id: String::new(),
+            cwd: String::new(),
+            fallback_model: String::new(),
+        }
+    }
+}
+
+/// Parses one line of a Pi-agent transcript (Pi and Oh My Pi). Each assistant
+/// message carries its own complete usage and cost, so no per-file repeats
+/// need dropping; message ids still dedupe history copied into forks.
+fn parse_pi_line(
+    line: &str,
+    provider: UsageProvider,
+    state: &mut PiScanState,
+) -> Option<UsageRecord> {
+    let record: Value = serde_json::from_str(line).ok()?;
+    match record.get("type").and_then(Value::as_str) {
+        Some("session") => {
+            if let Some(id) = record.get("id").and_then(Value::as_str) {
+                state.session_id = id.to_owned();
+            }
+            if let Some(cwd) = record.get("cwd").and_then(Value::as_str) {
+                state.cwd = cwd.to_owned();
+            }
+            return None;
+        }
+        Some("model_change") => {
+            // The two CLIs do not agree on the field: Oh My Pi writes the
+            // qualified `provider/model` as `model`, Pi splits it into
+            // `provider` and `modelId`.
+            if let Some(model) = record.get("model").and_then(Value::as_str) {
+                state.fallback_model = model.to_owned();
+            } else if let Some(model_id) = record.get("modelId").and_then(Value::as_str) {
+                state.fallback_model = match record.get("provider").and_then(Value::as_str) {
+                    Some(provider) if !provider.is_empty() => format!("{provider}/{model_id}"),
+                    _ => model_id.to_owned(),
+                };
+            }
+            return None;
+        }
+        _ => {}
+    }
+    if record.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    let message = record.get("message")?.as_object()?;
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let usage = message.get("usage")?.as_object()?;
+    let timestamp_ms = parse_timestamp_ms(record.get("timestamp"))?;
+    let model = message
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(&state.fallback_model);
+    if model.is_empty() {
+        return None;
+    }
+
+    let output = int(usage.get("output"));
+    let totals = TokenTotals {
+        uncached_input: int(usage.get("input")),
+        cached_input: int(usage.get("cacheRead")),
+        cache_creation: int(usage.get("cacheWrite")),
+        output,
+        // Reported inside output, surfaced separately for the mix.
+        reasoning: int(usage.get("reasoning")).min(output),
+    };
+    if totals.total() == 0 {
+        return None;
+    }
+
+    Some(UsageRecord {
+        provider,
+        timestamp_ms,
+        model: model.to_owned(),
+        session_id: state.session_id.clone(),
+        project: state.cwd.clone(),
+        totals,
+        dedupe_key: record
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|id| format!("pi:{id}")),
+    })
+}
+
+/// Session identity for a Kimi Code wire transcript. Neither record shape
+/// carries a session id, so it comes from the directory the wire log sits in.
+/// The modern layout nests `<workspace>/<session>/agents/<agent>/` and the
+/// older one `<workspace>/<session>/`. The agent name is tracked separately
+/// from the session because each subagent logs its own usage at the same wall
+/// clock as its parent, so only session *and* agent make a record unique —
+/// while the sessions the page counts remain one per session directory.
+struct KimiScanState {
+    /// The session the log belongs to: one per session directory.
+    session_id: String,
+    /// The agent whose log this is; empty for the single-log older layout.
+    agent: String,
+    /// The workspace directory key, resolved to a launch path by the scan.
+    workspace: String,
+}
+
+/// Parses one line of a Kimi Code `wire.jsonl`, in either of the two shapes
+/// Kimi has written.
+///
+/// The modern CLI (`~/.kimi-code`) records one `usage.record` per completed
+/// step, already scoped to that step, with camelCase counters. The older one
+/// (`~/.kimi`, pre-migration) emits a `StatusUpdate` per turn whose
+/// `token_usage` uses snake_case. Both are per-request, so records sum
+/// directly with no delta arithmetic.
+fn parse_kimi_line(line: &str, state: &KimiScanState) -> Option<UsageRecord> {
+    let record: Value = serde_json::from_str(line).ok()?;
+    let (timestamp_ms, usage, model, dedupe_key) =
+        if record.get("type").and_then(Value::as_str) == Some("usage.record") {
+            // A session-scoped rollup repeats the whole session's usage, so
+            // counting it would double every step already recorded.
+            if record.get("usageScope").and_then(Value::as_str) != Some("turn") {
+                return None;
+            }
+            let usage = record.get("usage")?.as_object()?;
+            let timestamp_ms = record
+                .get("time")
+                .and_then(Value::as_f64)
+                .filter(|time| time.is_finite())
+                .map(|time| time.trunc() as i64)?;
+            (
+                timestamp_ms,
+                TokenTotals {
+                    uncached_input: int(usage.get("inputOther")),
+                    cached_input: int(usage.get("inputCacheRead")),
+                    cache_creation: int(usage.get("inputCacheCreation")),
+                    output: int(usage.get("output")),
+                    reasoning: 0,
+                },
+                record
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_owned),
+                // One record per step. Two agents of the same session can
+                // record the same wall clock, so the agent names the log.
+                Some(format!(
+                    "kimi:{}:{}:{}",
+                    state.session_id, state.agent, timestamp_ms
+                )),
+            )
+        } else {
+            // Wire timestamps are fractional seconds since the epoch.
+            let timestamp_ms = record
+                .get("timestamp")
+                .and_then(Value::as_f64)
+                .filter(|seconds| seconds.is_finite())
+                .map(|seconds| (seconds * 1000.0).trunc() as i64)?;
+            let message = record.get("message")?.as_object()?;
+            if message.get("type").and_then(Value::as_str) != Some("StatusUpdate") {
+                return None;
+            }
+            let payload = message.get("payload")?.as_object()?;
+            let usage = payload.get("token_usage")?.as_object()?;
+            (
+                timestamp_ms,
+                TokenTotals {
+                    uncached_input: int(usage.get("input_other")),
+                    cached_input: int(usage.get("input_cache_read")),
+                    cache_creation: int(usage.get("input_cache_creation")),
+                    output: int(usage.get("output")),
+                    reasoning: 0,
+                },
+                // The old shape writes no model anywhere in its transcripts; the
+                // family label reports as unpriced rather than guessing one.
+                None,
+                payload
+                    .get("message_id")
+                    .and_then(Value::as_str)
+                    .map(|id| format!("kimi:{}:{}", state.session_id, id)),
+            )
+        };
+    if usage.total() == 0 {
+        return None;
+    }
+
+    Some(UsageRecord {
+        provider: UsageProvider::Kimi,
+        timestamp_ms,
+        model: model.unwrap_or_else(|| "kimi-code".to_owned()),
+        session_id: state.session_id.clone(),
+        project: state.workspace.clone(),
+        totals: usage,
+        dedupe_key,
+    })
+}
+
+/// Rolling state for a DeepSeek Harness session. Usage chunks carry no model,
+/// so it is carried forward from the most recent `request/header`.
+struct DshScanState {
+    session_id: String,
+    cwd: String,
+    model: String,
+}
+
+impl DshScanState {
+    fn new() -> Self {
+        Self {
+            session_id: String::new(),
+            cwd: String::new(),
+            model: String::new(),
+        }
+    }
+}
+
+/// Parses one line of a DeepSeek Harness session log. Each request's final
+/// usage arrives as an `assistant/chunk` of type `usage`; `seq` numbers every
+/// line, which keys cross-file deduplication.
+fn parse_dsh_line(line: &str, state: &mut DshScanState) -> Option<UsageRecord> {
+    let record: Value = serde_json::from_str(line).ok()?;
+    match record.get("type").and_then(Value::as_str) {
+        Some("session") => {
+            if let Some(id) = record.get("id").and_then(Value::as_str) {
+                state.session_id = id.to_owned();
+            }
+            if let Some(cwd) = record.get("cwd").and_then(Value::as_str) {
+                state.cwd = cwd.to_owned();
+            }
+            return None;
+        }
+        Some("request/header") => {
+            if let Some(model) = record
+                .get("data")
+                .and_then(|data| data.get("header"))
+                .and_then(|header| header.get("config"))
+                .and_then(|config| config.get("model"))
+                .and_then(Value::as_str)
+            {
+                state.model = model.to_owned();
+            }
+            return None;
+        }
+        _ => {}
+    }
+    if record.get("type").and_then(Value::as_str) != Some("assistant/chunk") {
+        return None;
+    }
+    let chunk = record.get("data")?.get("chunk")?.as_object()?;
+    if chunk.get("type").and_then(Value::as_str) != Some("usage") {
+        return None;
+    }
+    let usage = chunk.get("usage")?.as_object()?;
+    let timestamp_ms = record
+        .get("time")
+        .and_then(Value::as_f64)
+        .filter(|time| time.is_finite())
+        .map(|time| time.trunc() as i64)?;
+    // A usage chunk before any request/header has no model to attribute.
+    if state.model.is_empty() {
+        return None;
+    }
+    let totals = TokenTotals {
+        uncached_input: int(usage.get("inputTokens")),
+        output: int(usage.get("outputTokens")),
+        ..TokenTotals::default()
+    };
+    if totals.total() == 0 {
+        return None;
+    }
+
+    Some(UsageRecord {
+        provider: UsageProvider::DeepSeek,
+        timestamp_ms,
+        model: state.model.clone(),
+        session_id: state.session_id.clone(),
+        project: state.cwd.clone(),
+        totals,
+        dedupe_key: record
+            .get("seq")
+            .and_then(Value::as_i64)
+            .map(|seq| format!("dsh:{}:{seq}", state.session_id)),
     })
 }
 
@@ -372,7 +695,10 @@ pub struct ModelRate {
 
 #[derive(Clone, Debug)]
 pub struct RateTable {
+    /// Official model pricing; tried before the OpenRouter fallback.
     pub rates: HashMap<String, ModelRate>,
+    /// Per-token pricing from OpenRouter's catalog for models missing above.
+    pub openrouter: HashMap<String, ModelRate>,
     pub status: PricingStatus,
 }
 
@@ -380,6 +706,7 @@ impl RateTable {
     pub fn unavailable() -> Self {
         Self {
             rates: HashMap::new(),
+            openrouter: HashMap::new(),
             status: PricingStatus::Unavailable,
         }
     }
@@ -409,12 +736,25 @@ fn normalize_model_name(model: &str) -> String {
     }
 }
 
+/// Rates follow the official model price list; models the list prices
+/// incompletely fall back to OpenRouter's published catalog pricing.
 fn lookup_rate<'a>(table: &'a RateTable, model: &str) -> Option<&'a ModelRate> {
+    lookup_rate_with_source(table, model).map(|(rate, _)| rate)
+}
+
+fn lookup_rate_with_source<'a>(table: &'a RateTable, model: &str) -> Option<(&'a ModelRate, CostSource)> {
     let normalized = normalize_model_name(model);
     if normalized.is_empty() || UNPRICEABLE_MODELS.contains(&normalized.as_str()) {
         return None;
     }
-    table.rates.get(&normalized)
+    if let Some(rate) = table.rates.get(&normalized) {
+        Some((rate, CostSource::Official))
+    } else {
+        table
+            .openrouter
+            .get(&normalized)
+            .map(|rate| (rate, CostSource::OpenRouter))
+    }
 }
 
 /// Projects the LiteLLM document into a rate table. Entries without both an
@@ -453,6 +793,53 @@ fn parse_rate_table(document: &Value) -> HashMap<String, ModelRate> {
     table
 }
 
+/// Projects OpenRouter's model catalog into a rate table. Prices are USD
+/// strings per token; entries without both a prompt and a completion rate are
+/// dropped, mirroring the official table's rule. OpenRouter lists cache reads
+/// (and rarely writes) as separate fields, falling back to the plain input
+/// rate when absent.
+fn parse_openrouter_table(document: &Value) -> HashMap<String, ModelRate> {
+    let mut table = HashMap::new();
+    let Some(entries) = document.get("data").and_then(Value::as_array) else {
+        return table;
+    };
+    let rate = |entry: &serde_json::Map<String, Value>, key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    };
+    for entry in entries {
+        let Some(entry) = entry.as_object() else {
+            continue;
+        };
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let pricing = match entry.get("pricing").and_then(Value::as_object) {
+            Some(pricing) => pricing,
+            None => continue,
+        };
+        let Some(input) = rate(pricing, "prompt") else {
+            continue;
+        };
+        let Some(output) = rate(pricing, "completion") else {
+            continue;
+        };
+        table.insert(
+            normalize_model_name(id),
+            ModelRate {
+                input,
+                output,
+                cache_read: rate(pricing, "input_cache_read").unwrap_or(input),
+                cache_creation: rate(pricing, "input_cache_write").unwrap_or(input),
+            },
+        );
+    }
+    table
+}
+
 fn unix_time_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -460,85 +847,126 @@ fn unix_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn read_rates_cache(path: &Path) -> Option<(i64, HashMap<String, ModelRate>)> {
+fn read_rates_cache(
+    path: &Path,
+) -> Option<(
+    i64,
+    HashMap<String, ModelRate>,
+    HashMap<String, ModelRate>,
+)> {
     let document: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     let fetched_at_ms = document.get("fetched_at_ms")?.as_i64()?;
-    let mut rates = HashMap::new();
-    for (name, entry) in document.get("rates")?.as_object()? {
-        let values = entry.as_array()?;
-        let field = |index: usize| values.get(index).and_then(Value::as_f64);
-        rates.insert(
-            name.clone(),
-            ModelRate {
-                input: field(0)?,
-                output: field(1)?,
-                cache_read: field(2)?,
-                cache_creation: field(3)?,
-            },
-        );
-    }
-    Some((fetched_at_ms, rates))
+    let parse = |key: &str| -> Option<HashMap<String, ModelRate>> {
+        let mut rates = HashMap::new();
+        for (name, entry) in document.get(key)?.as_object()? {
+            let values = entry.as_array()?;
+            let field = |index: usize| values.get(index).and_then(Value::as_f64);
+            rates.insert(
+                name.clone(),
+                ModelRate {
+                    input: field(0)?,
+                    output: field(1)?,
+                    cache_read: field(2)?,
+                    cache_creation: field(3)?,
+                },
+            );
+        }
+        Some(rates)
+    };
+    // Caches written before the OpenRouter fallback existed carry only the
+    // official table; the fallback refetches with the next TTL.
+    Some((fetched_at_ms, parse("rates")?, parse("openrouter").unwrap_or_default()))
 }
 
-fn write_rates_cache(path: &Path, fetched_at_ms: i64, rates: &HashMap<String, ModelRate>) {
-    let entries: serde_json::Map<String, Value> = rates
-        .iter()
-        .map(|(name, rate)| {
-            (
-                name.clone(),
-                serde_json::json!([
-                    rate.input,
-                    rate.output,
-                    rate.cache_read,
-                    rate.cache_creation
-                ]),
-            )
-        })
-        .collect();
-    let document = serde_json::json!({ "fetched_at_ms": fetched_at_ms, "rates": entries });
+fn write_rates_cache(
+    path: &Path,
+    fetched_at_ms: i64,
+    rates: &HashMap<String, ModelRate>,
+    openrouter: &HashMap<String, ModelRate>,
+) {
+    let entries = |rates: &HashMap<String, ModelRate>| {
+        rates
+            .iter()
+            .map(|(name, rate)| {
+                (
+                    name.clone(),
+                    serde_json::json!([
+                        rate.input,
+                        rate.output,
+                        rate.cache_read,
+                        rate.cache_creation
+                    ]),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>()
+    };
+    let document = serde_json::json!({
+        "fetched_at_ms": fetched_at_ms,
+        "rates": entries(rates),
+        "openrouter": entries(openrouter),
+    });
     // Best effort: a cache that fails to write only costs the next scan a
     // refetch.
     let _ = std::fs::write(path, document.to_string());
 }
 
-/// Load the LiteLLM rate table, preferring the on-disk snapshot while it is
-/// within TTL, refetching otherwise, and degrading to the stale snapshot or an
-/// empty table rather than failing the scan. Blocking: disk plus up to one
-/// HTTPS round trip. Never call from the UI thread.
+/// Load the rate tables, preferring the on-disk snapshot while it is within
+/// TTL, refetching otherwise, and degrading to the stale snapshot or an empty
+/// table rather than failing the scan. Blocking: disk plus up to two HTTPS
+/// round trips. Never call from the UI thread.
 pub fn load_rate_table(cache_dir: &Path) -> RateTable {
     let cache_path = cache_dir.join(RATES_CACHE_FILE);
-    let disk = read_rates_cache(&cache_path).filter(|(_, rates)| !rates.is_empty());
+    let disk = read_rates_cache(&cache_path).filter(|(_, rates, _)| !rates.is_empty());
     let now_ms = unix_time_ms();
-    if let Some((fetched_at_ms, rates)) = &disk
+    if let Some((fetched_at_ms, rates, openrouter)) = &disk
         && now_ms.saturating_sub(*fetched_at_ms) < RATES_TTL.as_millis() as i64
     {
         return RateTable {
             rates: rates.clone(),
+            openrouter: openrouter.clone(),
             status: PricingStatus::Cached,
         };
     }
 
-    let fetched =
-        crate::usage::http_get(LITELLM_RATES_URL, &["Accept: application/json".to_owned()])
+    let fetch_json = |url: &str| {
+        crate::usage::http_get(url, &["Accept: application/json".to_owned()])
             .ok()
             .filter(|(status, _)| *status == 200)
             .and_then(|(_, body)| serde_json::from_str::<Value>(&body).ok())
-            .map(|document| parse_rate_table(&document))
-            .filter(|rates| !rates.is_empty());
+    };
+    let fetched = fetch_json(LITELLM_RATES_URL)
+        .map(|document| parse_rate_table(&document))
+        .filter(|rates| !rates.is_empty());
+    // The fallback only matters for models the official table omits, so skip
+    // the second round trip when the disk already holds it and the fetch
+    // succeeded.
+    let openrouter = match (&fetched, &disk) {
+        (Some(_), Some((_, _, openrouter))) if !openrouter.is_empty() => Some(openrouter.clone()),
+        _ => fetch_json(OPENROUTER_RATES_URL)
+            .map(|document| parse_openrouter_table(&document))
+            .filter(|rates| !rates.is_empty()),
+    };
 
-    match (fetched, disk) {
-        (Some(rates), _) => {
-            write_rates_cache(&cache_path, now_ms, &rates);
+    match (fetched, openrouter, disk) {
+        (Some(rates), openrouter, _) => {
+            write_rates_cache(
+                &cache_path,
+                now_ms,
+                &rates,
+                openrouter.as_ref().unwrap_or(&HashMap::new()),
+            );
             RateTable {
                 rates,
+                openrouter: openrouter.unwrap_or_default(),
                 status: PricingStatus::Fresh,
             }
         }
-        (None, Some((_, rates))) => RateTable {
+        (None, _, Some((_, rates, openrouter))) => RateTable {
             rates,
+            openrouter,
             status: PricingStatus::Cached,
         },
-        (None, None) => RateTable::unavailable(),
+        (None, _, None) => RateTable::unavailable(),
     }
 }
 
@@ -558,27 +986,66 @@ pub struct FileCacheEntry {
 
 pub type ScanCache = HashMap<PathBuf, FileCacheEntry>;
 
-/// The transcript root scanned for one provider.
-fn provider_root(provider: UsageProvider) -> Option<PathBuf> {
-    match provider {
-        UsageProvider::Claude => match std::env::var_os("CLAUDE_CONFIG_DIR") {
-            Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir).join("projects")),
-            _ => dirs::home_dir().map(|home| home.join(".claude/projects")),
-        },
+/// The transcript roots scanned for one provider.
+///
+/// Each arm reuses the resolver its own provider module already uses, so the
+/// scan reads exactly the transcripts that module would write: env overrides,
+/// a configured `sessionDir`, and Oh My Pi's per-profile directories all move
+/// sessions off the default path. Kimi has two stores — the modern
+/// `~/.kimi-code` the current CLI writes and the pre-migration `~/.kimi` an
+/// upgrade left behind — and both are scanned, because that migration copied
+/// the conversation rather than the usage records.
+fn provider_roots(provider: UsageProvider) -> Vec<PathBuf> {
+    let home = || dirs::home_dir().unwrap_or_default();
+    let mut roots = match provider {
+        UsageProvider::Claude => crate::claude_session::projects_directory()
+            .map(|dir| vec![dir])
+            .unwrap_or_default(),
         UsageProvider::Codex => match std::env::var_os("CODEX_HOME") {
-            Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir).join("sessions")),
-            _ => dirs::home_dir().map(|home| home.join(".codex/sessions")),
+            Some(dir) if !dir.is_empty() => vec![PathBuf::from(dir).join("sessions")],
+            _ => vec![home().join(".codex/sessions")],
         },
+        UsageProvider::DeepSeek => match std::env::var_os("DSH_HOME") {
+            Some(dir) if !dir.is_empty() => vec![PathBuf::from(dir).join("sessions")],
+            _ => vec![home().join(".dsh/sessions")],
+        },
+        UsageProvider::Kimi => crate::kimi_session::session_home()
+            .map(|dir| vec![dir.join("sessions")])
+            .unwrap_or_default(),
+        UsageProvider::OhMyPi | UsageProvider::Pi => {
+            let kind = if provider == UsageProvider::Pi {
+                ProviderKind::Pi
+            } else {
+                ProviderKind::OhMyPi
+            };
+            crate::pi_session::session_roots(kind).unwrap_or_default()
+        }
+    };
+    // The pre-migration Kimi store is only ever at the default location.
+    if provider == UsageProvider::Kimi && std::env::var_os("KIMI_CODE_HOME").is_none() {
+        roots.push(home().join(".kimi/sessions"));
+    }
+    roots
+}
+
+/// The transcript file extension one provider writes: `.jsonl` everywhere
+/// except DeepSeek Harness, which compresses each session to `.jsonl.zstd`.
+fn transcript_extension(provider: UsageProvider) -> &'static str {
+    match provider {
+        UsageProvider::DeepSeek => "zstd",
+        _ => "jsonl",
     }
 }
 
-/// Lists `.jsonl` transcripts under `root` modified at or after `since_ms`.
-/// Errors on individual entries are swallowed: session files rotate and get
-/// removed while the walk is in flight, and a partial listing beats failing
-/// the page. Returns the number of files skipped by the mtime prefilter.
+/// Lists a provider's transcripts under `root` modified at or after
+/// `since_ms`. Errors on individual entries are swallowed: session files
+/// rotate and get removed while the walk is in flight, and a partial listing
+/// beats failing the page. Returns the number of files skipped by the mtime
+/// prefilter.
 fn list_transcript_files(
     root: &Path,
     since_ms: i64,
+    extension: &str,
     found: &mut Vec<(PathBuf, u64, i64)>,
 ) -> usize {
     let mut skipped = 0;
@@ -591,10 +1058,10 @@ fn list_transcript_files(
             continue;
         };
         if file_type.is_dir() {
-            skipped += list_transcript_files(&path, since_ms, found);
+            skipped += list_transcript_files(&path, since_ms, extension, found);
             continue;
         }
-        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+        if path.extension().and_then(|ext| ext.to_str()) != Some(extension) {
             continue;
         }
         let Ok(metadata) = entry.metadata() else {
@@ -615,17 +1082,84 @@ fn list_transcript_files(
     skipped
 }
 
+/// The session identity a Kimi wire transcript records only implicitly. The
+/// modern layout nests the log as `<workspace>/<session>/agents/<agent>/`, so
+/// the session is the directory above `agents` and the workspace is the one
+/// above that. The older layout nests `<workspace-hash>/<session>/` directly.
+fn kimi_scan_state(path: &Path) -> KimiScanState {
+    // The log sits in the agent's own directory: `<session>/agents/<agent>/`
+    // in the modern layout, `<session>/` in the older one. Where the parent is
+    // the `agents` level, the session is one level further up.
+    let log_directory = path.parent().unwrap_or(Path::new(""));
+    let nest = log_directory.parent().unwrap_or(Path::new(""));
+    let modern = nest.file_name().and_then(|name| name.to_str()) == Some("agents");
+    let session_directory = if modern {
+        nest.parent().unwrap_or(Path::new(""))
+    } else {
+        log_directory
+    };
+    let name_of = |path: &Path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    KimiScanState {
+        session_id: name_of(session_directory),
+        agent: if modern {
+            name_of(log_directory)
+        } else {
+            String::new()
+        },
+        workspace: name_of(session_directory.parent().unwrap_or(Path::new(""))),
+    }
+}
+
+/// DeepSeek Harness appends to its session log, so its archive holds one zstd
+/// frame per flush: `StreamingDecoder` stops at the first frame's end and
+/// would silently drop the rest of the session. Walk the frames and hand back
+/// the concatenated payload, which is byte-for-byte the original log. A
+/// trailing partial frame — a write in flight while this reads — ends the
+/// walk with everything decoded so far; the next write changes the file's
+/// `(size, mtime)` and the cache rescans it.
+fn read_zstd_frames(path: &Path) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut content = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let Ok(mut decoder) = ruzstd::decoding::StreamingDecoder::new(&bytes[offset..]) else {
+            break;
+        };
+        if std::io::Read::read_to_end(&mut decoder, &mut content).is_err() {
+            break;
+        }
+        let consumed = decoder.decoder.bytes_read_from_source() as usize;
+        if consumed == 0 {
+            break;
+        }
+        offset += consumed;
+    }
+    Some(content)
+}
+
 /// Streams one transcript and returns the usage records it contains, already
 /// de-duplicated within the file, or `None` when it could not be read. The
 /// distinction matters to the cache: an empty transcript is a stable fact
 /// worth memoising, while a transient read failure memoised under the same
 /// `(size, mtime)` would silently drop the file's usage until it changes.
 fn read_transcript_records(path: &Path, provider: UsageProvider) -> Option<Vec<UsageRecord>> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut reader = std::io::BufReader::new(file);
+    let mut reader: Box<dyn std::io::BufRead> = match provider {
+        UsageProvider::DeepSeek => {
+            let content = read_zstd_frames(path)?;
+            Box::new(std::io::BufReader::new(std::io::Cursor::new(content)))
+        }
+        _ => Box::new(std::io::BufReader::new(std::fs::File::open(path).ok()?)),
+    };
     let mut line = String::new();
     let mut records = Vec::new();
     let mut codex_state = CodexScanState::new();
+    let mut pi_state = PiScanState::new();
+    let mut dsh_state = DshScanState::new();
+    let kimi_state = kimi_scan_state(path);
     let mut seen_in_file = HashSet::new();
 
     loop {
@@ -635,38 +1169,32 @@ fn read_transcript_records(path: &Path, provider: UsageProvider) -> Option<Vec<U
             Ok(_) => {}
             Err(_) => return None,
         }
-        match provider {
-            UsageProvider::Codex => {
-                // Codex carries the active model on `turn_context` lines that
-                // hold no usage of their own, so those still pass through the
-                // reducer to keep model attribution correct.
-                if !might_carry_usage(&line, provider)
-                    && !line.contains("\"turn_context\"")
-                    && !line.contains("\"session_meta\"")
-                {
-                    continue;
-                }
-                if let Some(record) = parse_codex_line(&line, &mut codex_state) {
-                    records.push(record);
-                }
+        // Context lines (session headers, model switches) advance a parser's
+        // rolling state without carrying usage themselves.
+        if !might_carry_usage(&line, provider) && !carries_scan_context(&line, provider) {
+            continue;
+        }
+        let record = match provider {
+            UsageProvider::Codex => parse_codex_line(&line, &mut codex_state),
+            UsageProvider::Claude => parse_claude_line(&line),
+            UsageProvider::OhMyPi | UsageProvider::Pi => {
+                parse_pi_line(&line, provider, &mut pi_state)
             }
-            UsageProvider::Claude => {
-                if !might_carry_usage(&line, provider) {
-                    continue;
-                }
-                if let Some(record) = parse_claude_line(&line) {
-                    // Every assistant content block repeats the parent
-                    // message's usage; the first record wins. Cross-file
-                    // repeats (resumed or forked sessions) are handled by the
-                    // aggregator's global pass.
-                    if let Some(key) = &record.dedupe_key {
-                        if !seen_in_file.insert(key.clone()) {
-                            continue;
-                        }
-                    }
-                    records.push(record);
-                }
+            UsageProvider::Kimi => parse_kimi_line(&line, &kimi_state),
+            UsageProvider::DeepSeek => parse_dsh_line(&line, &mut dsh_state),
+        };
+        if let Some(record) = record {
+            // Every Claude assistant content block repeats the parent
+            // message's usage; the first record wins. Cross-file repeats
+            // (resumed or forked sessions) are handled by the aggregator's
+            // global pass.
+            if provider == UsageProvider::Claude
+                && let Some(key) = &record.dedupe_key
+                && !seen_in_file.insert(key.clone())
+            {
+                continue;
             }
+            records.push(record);
         }
     }
     Some(records)
@@ -678,8 +1206,8 @@ fn read_transcript_records(path: &Path, provider: UsageProvider) -> Option<Vec<U
 
 #[derive(Clone, Copy, PartialEq)]
 enum CostSource {
-    Reported,
-    Priced,
+    Official,
+    OpenRouter,
     Unpriced,
 }
 
@@ -690,7 +1218,8 @@ struct Bucket {
     cache_savings_usd: f64,
     records: u64,
     unpriced_records: u64,
-    reported_records: u64,
+    official_records: u64,
+    openrouter_records: u64,
 }
 
 /// Per-project accumulation, keyed by the resolved project path.
@@ -698,7 +1227,7 @@ struct Bucket {
 struct ProjectAccumulator {
     cost_usd: f64,
     total_tokens: u64,
-    by_provider: [ProviderDay; 2],
+    by_provider: [ProviderDay; UsageProvider::COUNT],
     sessions: HashSet<(UsageProvider, String)>,
     /// Cost per model, for the row's "top models" caption.
     models: HashMap<String, f64>,
@@ -756,10 +1285,10 @@ impl Aggregator {
     }
 
     fn add(&mut self, record: &UsageRecord, rates: &RateTable) {
-        if let Some(key) = &record.dedupe_key {
-            if !self.seen.insert(key.clone()) {
-                return;
-            }
+        if let Some(key) = &record.dedupe_key
+            && !self.seen.insert(key.clone())
+        {
+            return;
         }
         let Some(timestamp) = Utc.timestamp_millis_opt(record.timestamp_ms).single() else {
             return;
@@ -769,18 +1298,19 @@ impl Aggregator {
             return;
         }
 
-        let (cost_usd, source) = match record.reported_cost_usd {
-            Some(cost) => (cost, CostSource::Reported),
-            None => match lookup_rate(rates, &record.model) {
-                Some(rate) => (
-                    record.totals.uncached_input as f64 * rate.input
-                        + record.totals.cached_input as f64 * rate.cache_read
-                        + record.totals.cache_creation as f64 * rate.cache_creation
-                        + record.totals.output as f64 * rate.output,
-                    CostSource::Priced,
-                ),
-                None => (0.0, CostSource::Unpriced),
-            },
+        // Cost always follows the model's list price — the official table
+        // first, OpenRouter's catalog as fallback — whether the session ran on
+        // a subscription or metered billing. Provider-reported costs are
+        // deliberately ignored: they mix list and negotiated rates.
+        let (cost_usd, source) = match lookup_rate_with_source(rates, &record.model) {
+            Some((rate, source)) => (
+                record.totals.uncached_input as f64 * rate.input
+                    + record.totals.cached_input as f64 * rate.cache_read
+                    + record.totals.cache_creation as f64 * rate.cache_creation
+                    + record.totals.output as f64 * rate.output,
+                source,
+            ),
+            None => (0.0, CostSource::Unpriced),
         };
         // What the cached input would have cost at full input rates, minus
         // what it actually cost. Drives the "cache savings" figure.
@@ -798,8 +1328,8 @@ impl Aggregator {
         bucket.records += 1;
         match source {
             CostSource::Unpriced => bucket.unpriced_records += 1,
-            CostSource::Reported => bucket.reported_records += 1,
-            CostSource::Priced => {}
+            CostSource::Official => bucket.official_records += 1,
+            CostSource::OpenRouter => bucket.openrouter_records += 1,
         }
         if !record.session_id.is_empty() {
             self.sessions
@@ -828,6 +1358,96 @@ impl Aggregator {
     }
 }
 
+/// Kimi names each session directory after the workspace it ran in, and the
+/// launch directory only survives elsewhere on disk. Recover it by mapping the
+/// directory name back to a path, using the records Kimi itself keeps: the
+/// modern `workspaces.json` (exact name → root), and the older
+/// `session_index.jsonl` plus `kimi.json` work dirs (session id → work dir,
+/// and the MD5-named workspace directories). Launches in neither list stay
+/// unattributed rather than guessed.
+///
+/// The map is keyed by both the workspace directory name and the session name,
+/// since the two layouts split the identity differently.
+fn kimi_project_map(project_roots: &[PathBuf]) -> HashMap<String, String> {
+    let home = dirs::home_dir();
+    let kimi_code_home = home
+        .as_ref()
+        .map(|home| home.join(".kimi-code"))
+        .unwrap_or_default();
+    kimi_project_map_in(home.as_deref(), &kimi_code_home, project_roots)
+}
+
+fn kimi_project_map_in(
+    home: Option<&Path>,
+    kimi_code_home: &Path,
+    project_roots: &[PathBuf],
+) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+
+    // The modern store: one entry per workspace, named exactly as its
+    // directory is.
+    if let Ok(document) = std::fs::read_to_string(kimi_code_home.join("workspaces.json"))
+        && let Ok(root) = serde_json::from_str::<Value>(&document)
+        && let Some(workspaces) = root.get("workspaces").and_then(Value::as_object)
+    {
+        for (name, workspace) in workspaces {
+            if let Some(path) = workspace.get("root").and_then(Value::as_str) {
+                map.insert(name.clone(), path.to_owned());
+            }
+        }
+    }
+    // Sessions migrated from the older store keep their id and record the
+    // working directory explicitly.
+    if let Ok(document) = std::fs::read_to_string(kimi_code_home.join("session_index.jsonl")) {
+        for line in document.lines() {
+            let Ok(entry) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if let (Some(session_id), Some(work_dir)) = (
+                entry.get("sessionId").and_then(Value::as_str),
+                entry.get("workDir").and_then(Value::as_str),
+            ) {
+                map.insert(session_id.to_owned(), work_dir.to_owned());
+            }
+        }
+    }
+
+    // The older store names its workspace directories after the MD5 of the
+    // launch path, so its map is built from the forward digest.
+    let mut legacy_paths: Vec<String> = Vec::new();
+    if let Some(home) = home
+        && let Ok(document) = std::fs::read_to_string(home.join(".kimi/kimi.json"))
+        && let Ok(root) = serde_json::from_str::<Value>(&document)
+        && let Some(work_dirs) = root.get("work_dirs").and_then(Value::as_array)
+    {
+        for entry in work_dirs {
+            if let Some(path) = entry.get("path").and_then(Value::as_str) {
+                legacy_paths.push(path.to_owned());
+            }
+        }
+    }
+    for root in project_roots {
+        legacy_paths.push(root.display().to_string());
+    }
+    for path in legacy_paths {
+        map.insert(md5_hex(&path), path);
+    }
+    map
+}
+
+/// The MD5 hex digest Kimi Code uses as a session directory's name — verified
+/// against `md5("/Users/jiyuliang/工作/DSP-Modeling/Qi-Pure")` on a live
+/// `~/.kimi/sessions` tree.
+fn md5_hex(path: &str) -> String {
+    use std::fmt::Write as _;
+    let digest = md5::Md5::digest(path.as_bytes());
+    let mut hash = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hash, "{byte:02x}");
+    }
+    hash
+}
+
 /// Scan every provider's transcripts for `window` ending today and derive
 /// the page snapshot. `project_roots` are the app's known project paths, used
 /// to attribute working directories to projects. Blocking; run on the
@@ -848,6 +1468,9 @@ pub fn scan(
         .map(|midnight| midnight.timestamp_millis())
         .unwrap_or_else(|| unix_time_ms() - (until_day - since_day).num_days().max(1) * 86_400_000);
     let mtime_cutoff_ms = window_start_ms - MTIME_SLACK.as_millis() as i64;
+    // Kimi's project attribution is resolved at scan time, not parse time, so
+    // newly known project roots reattribute cached transcripts.
+    let kimi_projects = kimi_project_map(project_roots);
 
     let mut aggregator = Aggregator::new(since_day, until_day, project_roots);
     let mut scanned_files = 0;
@@ -855,58 +1478,79 @@ pub fn scan(
     let mut errors = Vec::new();
 
     for provider in UsageProvider::ALL {
-        let Some(root) = provider_root(provider) else {
-            continue;
-        };
-        if !root.is_dir() {
-            // Provider never used on this machine; zero usage, not an error.
-            continue;
-        }
-        let mut files = Vec::new();
-        skipped_files += list_transcript_files(&root, mtime_cutoff_ms, &mut files);
-        if files.is_empty() && std::fs::read_dir(&root).is_err() {
-            errors.push(format!(
-                "{} transcripts at {} could not be read.",
-                provider.label(),
-                root.display()
-            ));
-            continue;
-        }
-        for (path, size, mtime_ms) in files {
-            scanned_files += 1;
-            let cached = cache.get(&path);
-            // Provider is part of the identity: if both providers were ever
-            // pointed at one directory, a hit parsed by the other parser must
-            // not be reused.
-            let records = match cached {
-                Some(entry)
-                    if entry.size == size
-                        && entry.mtime_ms == mtime_ms
-                        && entry.provider == provider =>
-                {
-                    &entry.records
-                }
-                _ => match read_transcript_records(&path, provider) {
-                    Some(records) => {
-                        &cache
-                            .entry(path)
-                            .insert_entry(FileCacheEntry {
-                                size,
-                                mtime_ms,
-                                provider,
-                                records,
-                            })
-                            .into_mut()
-                            .records
+        for root in provider_roots(provider) {
+            if !root.is_dir() {
+                // Provider never used on this machine; zero usage, not an error.
+                continue;
+            }
+            let mut files = Vec::new();
+            skipped_files += list_transcript_files(
+                &root,
+                mtime_cutoff_ms,
+                transcript_extension(provider),
+                &mut files,
+            );
+            if files.is_empty() && std::fs::read_dir(&root).is_err() {
+                errors.push(format!(
+                    "{} transcripts at {} could not be read.",
+                    provider.label(),
+                    root.display()
+                ));
+                continue;
+            }
+            for (path, size, mtime_ms) in files {
+                scanned_files += 1;
+                let cached = cache.get(&path);
+                // Provider is part of the identity: if two providers were ever
+                // pointed at one directory, a hit parsed by the other parser must
+                // not be reused.
+                let records = match cached {
+                    Some(entry)
+                        if entry.size == size
+                            && entry.mtime_ms == mtime_ms
+                            && entry.provider == provider =>
+                    {
+                        &entry.records
                     }
-                    // A read failure is not an empty transcript: caching it
-                    // under this (size, mtime) would silently drop the file's
-                    // usage until it changes.
-                    None => continue,
-                },
-            };
-            for record in records {
-                aggregator.add(record, rates);
+                    _ => match read_transcript_records(&path, provider) {
+                        Some(records) => {
+                            &cache
+                                .entry(path)
+                                .insert_entry(FileCacheEntry {
+                                    size,
+                                    mtime_ms,
+                                    provider,
+                                    records,
+                                })
+                                .into_mut()
+                                .records
+                        }
+                        // A read failure is not an empty transcript: caching it
+                        // under this (size, mtime) would silently drop the file's
+                        // usage until it changes.
+                        None => continue,
+                    },
+                };
+                for record in records {
+                    // Kimi's transcripts name the working directory only as a
+                    // workspace or session directory; resolve it against the
+                    // paths Kimi itself remembers, leaving unknown names
+                    // unattributed.
+                    let resolved;
+                    let record = if record.provider == UsageProvider::Kimi {
+                        resolved = UsageRecord {
+                            project: kimi_projects
+                                .get(&record.project)
+                                .cloned()
+                                .unwrap_or_default(),
+                            ..record.clone()
+                        };
+                        &resolved
+                    } else {
+                        record
+                    };
+                    aggregator.add(record, rates);
+                }
             }
         }
     }
@@ -941,7 +1585,8 @@ fn derive_history(
     let mut cache_savings_usd = 0.0;
     let mut records = 0;
     let mut unpriced_records = 0;
-    let mut reported_records = 0;
+    let mut official_records = 0;
+    let mut openrouter_records = 0;
     let mut providers: HashMap<UsageProvider, (f64, u64)> = HashMap::new();
     let mut models: HashMap<(UsageProvider, String), (f64, u64)> = HashMap::new();
     let mut daily: HashMap<NaiveDate, DaySlice> = HashMap::new();
@@ -954,7 +1599,8 @@ fn derive_history(
         cache_savings_usd += bucket.cache_savings_usd;
         records += bucket.records;
         unpriced_records += bucket.unpriced_records;
-        reported_records += bucket.reported_records;
+        official_records += bucket.official_records;
+        openrouter_records += bucket.openrouter_records;
 
         let provider_entry = providers.entry(*provider).or_default();
         provider_entry.0 += bucket.cost_usd;
@@ -968,7 +1614,7 @@ fn derive_history(
             day: *day,
             cost_usd: 0.0,
             total_tokens: 0,
-            by_provider: [ProviderDay::default(); 2],
+            by_provider: [ProviderDay::default(); UsageProvider::COUNT],
         });
         day_entry.cost_usd += bucket.cost_usd;
         day_entry.total_tokens += tokens;
@@ -995,7 +1641,14 @@ fn derive_history(
             },
         )
         .collect();
-    provider_slices.sort_by(|a, b| b.cost_usd.total_cmp(&a.cost_usd));
+    // Cost descends; ties break by lane order so an all-unpriced window still
+    // renders the same chart legend and columns on every scan instead of
+    // following hash-map iteration order.
+    provider_slices.sort_by(|a, b| {
+        b.cost_usd
+            .total_cmp(&a.cost_usd)
+            .then(a.provider.index().cmp(&b.provider.index()))
+    });
 
     let mut model_slices: Vec<ModelSlice> = models
         .into_iter()
@@ -1006,13 +1659,14 @@ fn derive_history(
                 cost_usd: model_cost,
                 total_tokens: model_tokens,
                 cost_share: share(model_cost, cost_usd),
+                token_share: share(model_tokens as f64, total_tokens as f64),
             },
         )
         .collect();
     model_slices.sort_by(|a, b| {
-        b.cost_usd
-            .total_cmp(&a.cost_usd)
-            .then(b.total_tokens.cmp(&a.total_tokens))
+        b.total_tokens
+            .cmp(&a.total_tokens)
+            .then(b.cost_usd.total_cmp(&a.cost_usd))
     });
 
     let mut day_slices: Vec<DaySlice> = daily.into_values().collect();
@@ -1028,7 +1682,7 @@ fn derive_history(
                 first_day: first_of_month(day.day),
                 cost_usd: 0.0,
                 total_tokens: 0,
-                by_provider: [ProviderDay::default(); 2],
+                by_provider: [ProviderDay::default(); UsageProvider::COUNT],
                 sessions: 0,
                 active_days: 0,
                 top_models: Vec::new(),
@@ -1099,8 +1753,8 @@ fn derive_history(
         months: month_slices,
         projects: project_slices,
         quality: CostQuality {
-            provider_reported_share: record_share(reported_records),
-            model_priced_share: record_share(records - reported_records - unpriced_records),
+            official_priced_share: record_share(official_records),
+            openrouter_priced_share: record_share(openrouter_records),
             unpriced_share: record_share(unpriced_records),
             cache_savings_usd,
         },
@@ -1164,6 +1818,7 @@ mod tests {
                 .iter()
                 .map(|(name, rate)| ((*name).to_owned(), *rate))
                 .collect(),
+            openrouter: HashMap::new(),
             status: PricingStatus::Fresh,
         }
     }
@@ -1244,7 +1899,6 @@ mod tests {
         assert_eq!(record.session_id, "session-1");
         assert_eq!(record.project, "/Users/me/dev/waku");
         assert_eq!(record.dedupe_key.as_deref(), Some("msg_1:req_1"));
-        assert_eq!(record.reported_cost_usd, None);
         assert_eq!(record.totals.uncached_input, 2);
         assert_eq!(record.totals.cache_creation, 50700);
         assert_eq!(record.totals.output, 1238);
@@ -1434,7 +2088,6 @@ mod tests {
                 output: 500,
                 reasoning: 0,
             },
-            reported_cost_usd: None,
             dedupe_key: Some("msg:req".to_owned()),
         };
         let today = Local::now().date_naive();
@@ -1465,7 +2118,7 @@ mod tests {
         assert!((history.quality.cache_savings_usd - expected_savings).abs() < 1e-9);
         assert_eq!(history.daily.len(), 1);
         assert_eq!(history.providers.len(), 1);
-        assert!((history.quality.model_priced_share - 1.0).abs() < f64::EPSILON);
+        assert!((history.quality.official_priced_share - 1.0).abs() < f64::EPSILON);
 
         // The subdirectory cwd resolved to its containing project root, and
         // the month fold carries the same totals as the single active day.
@@ -1507,7 +2160,6 @@ mod tests {
                 uncached_input: 100,
                 ..TokenTotals::default()
             },
-            reported_cost_usd: None,
             dedupe_key: None,
         };
         aggregator.add(&record(0, "session-now", "/a"), &rates);
@@ -1553,7 +2205,6 @@ mod tests {
                 uncached_input: 100,
                 ..TokenTotals::default()
             },
-            reported_cost_usd: None,
             dedupe_key: None,
         };
         aggregator.add(&record, &rates);
@@ -1613,12 +2264,52 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("waku-usage-rates-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(RATES_CACHE_FILE);
-        write_rates_cache(&path, 12345, &rates);
-        let (fetched_at_ms, restored) = read_rates_cache(&path).expect("cache round-trips");
+        write_rates_cache(&path, 12345, &rates, &HashMap::new());
+        let (fetched_at_ms, restored, openrouter) = read_rates_cache(&path).expect("cache round-trips");
         assert_eq!(fetched_at_ms, 12345);
         assert_eq!(restored.len(), rates.len());
         assert_eq!(restored["claude-fable-5"], rates["claude-fable-5"]);
+        assert!(openrouter.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn openrouter_catalog_prices_the_official_fallback() {
+        let document: Value = serde_json::from_str(
+            r#"{
+                "data": [
+                    {"id": "openai/gpt-5.3-codex", "pricing": {"prompt": "0.000003",
+                        "completion": "0.000009", "input_cache_read": "0.0000003"}},
+                    {"id": "moonshotai/kimi-k2.5", "pricing": {"prompt": "0.000002",
+                        "completion": "0.000008", "input_cache_write": "0.000004"}},
+                    {"id": "free-variant:free", "pricing": {"prompt": "0", "completion": "0"}},
+                    {"id": "half-priced", "pricing": {"prompt": "0.000001"}},
+                    {"id": "no-pricing"},
+                    {"pricing": {"prompt": "1", "completion": "2"}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let rates = parse_openrouter_table(&document);
+        assert_eq!(rates.len(), 3, "unusable entries are dropped");
+        let codex = &rates["gpt-5.3-codex"];
+        assert_eq!(codex.input, 3e-6);
+        assert_eq!(codex.output, 9e-6);
+        // The catalog's explicit cache-read rate survives; the write rate
+        // falls back to the plain input rate, not to free.
+        assert_eq!(codex.cache_read, 3e-7);
+        assert_eq!(codex.cache_creation, 3e-6);
+        assert_eq!(rates["kimi-k2.5"].cache_creation, 4e-6);
+
+        // The lookup prefers official rates and only then OpenRouter's.
+        let mut table = rate_table(&[("claude-fable-5", FLAT_RATE)]);
+        table.openrouter = rates;
+        assert_eq!(
+            lookup_rate(&table, "anthropic/claude-fable-5").unwrap().input,
+            1e-6,
+            "official pricing wins"
+        );
+        assert_eq!(lookup_rate(&table, "openai/gpt-5.3-codex").unwrap().input, 3e-6);
     }
 
     #[test]
@@ -1669,5 +2360,282 @@ mod tests {
         assert_eq!(days[0], since);
         assert_eq!(days[2], until);
         assert_eq!(enumerate_days(until, since), Vec::<NaiveDate>::new());
+    }
+
+    #[test]
+    fn pi_lines_parse_usage_model_and_dedupe_key() {
+        // Shapes captured from live ~/.omp and ~/.pi session transcripts: the
+        // two CLIs share one message format but not the `model_change` fields.
+        let session = r#"{"type":"session","version":3,"id":"019fe6b1-835b-7000-9fb4-252c89d32281","timestamp":"2026-08-09T13:23:41.019Z","cwd":"/Users/me/dev/waku"}"#;
+        let message = r#"{"type":"message","id":"7f49a50f","parentId":"b8a3e260","timestamp":"2026-08-09T13:23:55.721Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"api":"ollama-chat","provider":"ollama-cloud","model":"glm-5.2","usage":{"input":8987,"output":198,"cacheRead":512,"cacheWrite":0,"reasoning":83,"totalTokens":9697,"cost":{"input":0.0026961,"output":0.0002376,"cacheRead":0.000003072,"cacheWrite":0,"total":0.002936772}}}}"#;
+        let mut state = PiScanState::new();
+        assert!(parse_pi_line(session, UsageProvider::OhMyPi, &mut state).is_none());
+
+        let record =
+            parse_pi_line(message, UsageProvider::OhMyPi, &mut state).expect("usage present");
+        assert_eq!(record.provider, UsageProvider::OhMyPi);
+        assert_eq!(record.model, "glm-5.2");
+        assert_eq!(record.session_id, "019fe6b1-835b-7000-9fb4-252c89d32281");
+        assert_eq!(record.project, "/Users/me/dev/waku");
+        assert_eq!(record.timestamp_ms, 1_786_281_835_721);
+        assert_eq!(record.totals.uncached_input, 8987);
+        assert_eq!(record.totals.cached_input, 512);
+        assert_eq!(record.totals.cache_creation, 0);
+        assert_eq!(record.totals.output, 198);
+        assert_eq!(record.totals.reasoning, 83);
+        assert_eq!(record.dedupe_key.as_deref(), Some("pi:7f49a50f"));
+
+        // A user line and a usage-less assistant line parse to nothing.
+        assert!(parse_pi_line(
+            r#"{"type":"message","timestamp":"2026-08-09T13:23:56.000Z","message":{"role":"user","content":[]}}"#,
+            UsageProvider::OhMyPi,
+            &mut state
+        )
+        .is_none());
+        assert!(parse_pi_line(
+            r#"{"type":"message","timestamp":"2026-08-09T13:23:56.000Z","message":{"role":"assistant","content":[]}}"#,
+            UsageProvider::OhMyPi,
+            &mut state
+        )
+        .is_none());
+
+        // A record without its own model falls back to `model_change`, whose
+        // shape the two CLIs spell differently: Oh My Pi writes the qualified
+        // `model`, Pi splits it into `provider` and `modelId`.
+        assert!(parse_pi_line(
+            r#"{"type":"model_change","id":"108b8777","parentId":null,"timestamp":"2026-08-09T13:23:41.066Z","model":"ollama-cloud/glm-5.2","resolvedModelIsFallback":false}"#,
+            UsageProvider::OhMyPi,
+            &mut state
+        )
+        .is_none());
+        let bare = parse_pi_line(
+            r#"{"type":"message","id":"9faba389","timestamp":"2026-08-09T13:24:01.000Z","message":{"role":"assistant","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":15}}}"#,
+            UsageProvider::OhMyPi,
+            &mut state,
+        )
+        .expect("the fallback model attributes the record");
+        assert_eq!(bare.provider, UsageProvider::OhMyPi);
+        assert_eq!(bare.model, "ollama-cloud/glm-5.2");
+
+        // Pi's own split shape, captured from a live ~/.pi transcript.
+        let mut pi_state = PiScanState::new();
+        assert!(parse_pi_line(
+            r#"{"type":"model_change","id":"6418d4c7","parentId":null,"timestamp":"2026-08-10T13:21:32.477Z","provider":"kimi-coding","modelId":"k3-256k"}"#,
+            UsageProvider::Pi,
+            &mut pi_state
+        )
+        .is_none());
+        let pi_bare = parse_pi_line(
+            r#"{"type":"message","id":"5c1e2b04","timestamp":"2026-08-10T13:22:59.804Z","message":{"role":"assistant","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":15}}}"#,
+            UsageProvider::Pi,
+            &mut pi_state,
+        )
+        .expect("Pi's split model_change attributes the record");
+        assert_eq!(pi_bare.provider, UsageProvider::Pi);
+        assert_eq!(pi_bare.model, "kimi-coding/k3-256k");
+    }
+
+    #[test]
+    fn kimi_wire_updates_parse_per_step_usage_in_both_formats() {
+        // The older shape, captured from a live ~/.kimi/sessions wire.jsonl.
+        let legacy = KimiScanState {
+            session_id: "9ce64e58-5796-47fd-94f6-e52162446e90".to_owned(),
+            agent: String::new(),
+            workspace: "b7d87b9c610d01d676c088f03905388d".to_owned(),
+        };
+        let update = r#"{"timestamp": 1774854982.58214, "message": {"type": "StatusUpdate", "payload": {"context_usage": 0.037, "context_tokens": 9736, "max_context_tokens": 262144, "token_usage": {"input_other": 1800, "output": 90, "input_cache_read": 7936, "input_cache_creation": 0}, "message_id": "chatcmpl-b1dqq0rsBjfW2OPoJRr7eBKv", "plan_mode": false}}}"#;
+        let record = parse_kimi_line(update, &legacy).expect("a completed turn carries usage");
+        assert_eq!(record.provider, UsageProvider::Kimi);
+        assert_eq!(record.model, "kimi-code");
+        assert_eq!(record.session_id, "9ce64e58-5796-47fd-94f6-e52162446e90");
+        assert_eq!(record.project, "b7d87b9c610d01d676c088f03905388d");
+        assert_eq!(record.timestamp_ms, 1_774_854_982_582);
+        assert_eq!(record.totals.uncached_input, 1800);
+        assert_eq!(record.totals.cached_input, 7936);
+        assert_eq!(record.totals.output, 90);
+        assert_eq!(
+            record.dedupe_key.as_deref(),
+            Some("kimi:9ce64e58-5796-47fd-94f6-e52162446e90:chatcmpl-b1dqq0rsBjfW2OPoJRr7eBKv")
+        );
+
+        // Other wire traffic and zero-usage updates parse to nothing.
+        assert!(
+            parse_kimi_line(
+                r#"{"timestamp": 1774854982.0, "message": {"type": "TurnBegin", "payload": {}}}"#,
+                &legacy
+            )
+            .is_none()
+        );
+        assert!(parse_kimi_line(
+            r#"{"timestamp": 1774854982.0, "message": {"type": "StatusUpdate", "payload": {"token_usage": {"input_other": 0, "output": 0, "input_cache_read": 0, "input_cache_creation": 0}, "message_id": "chatcmpl-zero"}}}"#,
+            &legacy
+        )
+        .is_none());
+
+        // The modern shape, captured from a live ~/.kimi-code
+        // `<session>/agents/main/wire.jsonl` on 2026-09-25.
+        let modern = KimiScanState {
+            session_id: "session_90dbd78a-5176-4f37-88e8-43d27da01ed4".to_owned(),
+            agent: "main".to_owned(),
+            workspace: "wd_renamer_77d4205a98d1".to_owned(),
+        };
+        let step = r#"{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":8839,"output":312,"inputCacheRead":14592,"inputCacheCreation":0},"usageScope":"turn","time":1782527245226}"#;
+        let record = parse_kimi_line(step, &modern).expect("a completed step carries usage");
+        assert_eq!(record.model, "kimi-code/kimi-for-coding");
+        assert_eq!(
+            record.session_id,
+            "session_90dbd78a-5176-4f37-88e8-43d27da01ed4"
+        );
+        assert_eq!(record.project, "wd_renamer_77d4205a98d1");
+        assert_eq!(record.timestamp_ms, 1_782_527_245_226);
+        assert_eq!(record.totals.uncached_input, 8839);
+        assert_eq!(record.totals.cached_input, 14592);
+        assert_eq!(record.totals.output, 312);
+        assert_eq!(
+            record.dedupe_key.as_deref(),
+            Some("kimi:session_90dbd78a-5176-4f37-88e8-43d27da01ed4:main:1782527245226")
+        );
+
+        // The session-scope rollup repeats steps already counted, so it must
+        // never become a record of its own.
+        assert!(parse_kimi_line(
+            r#"{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":644,"output":2018,"inputCacheRead":207616,"inputCacheCreation":0},"usageScope":"session","time":1782549291718}"#,
+            &modern
+        )
+        .is_none());
+        assert!(parse_kimi_line(
+            r#"{"type":"usage.record","usage":{"inputOther":0,"output":0,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1782549291718}"#,
+            &modern
+        )
+        .is_none());
+    }
+
+    /// The two Kimi layouts place the wire log at different depths, and the
+    /// session and workspace names live at different levels.
+    #[test]
+    fn kimi_scan_state_reads_both_wire_log_layouts() {
+        let modern = kimi_scan_state(Path::new(
+            "/h/.kimi-code/sessions/wd_renamer_77d4205a98d1/session_90dbd78a/agents/main/wire.jsonl",
+        ));
+        assert_eq!(modern.session_id, "session_90dbd78a");
+        assert_eq!(modern.agent, "main");
+        assert_eq!(modern.workspace, "wd_renamer_77d4205a98d1");
+
+        // A subagent's log belongs to the same session but is its own log: two
+        // agents can record the same wall clock, and only the agent name keeps
+        // their records apart.
+        let modern_subagent = kimi_scan_state(Path::new(
+            "/h/.kimi-code/sessions/wd_renamer_77d4205a98d1/session_90dbd78a/agents/agent-7/wire.jsonl",
+        ));
+        assert_eq!(modern_subagent.session_id, "session_90dbd78a");
+        assert_eq!(modern_subagent.agent, "agent-7");
+        assert_eq!(modern_subagent.workspace, "wd_renamer_77d4205a98d1");
+
+        let legacy = kimi_scan_state(Path::new(
+            "/h/.kimi/sessions/b7d87b9c610d01d676c088f03905388d/9ce64e58-5796/wire.jsonl",
+        ));
+        assert_eq!(legacy.session_id, "9ce64e58-5796");
+        assert_eq!(legacy.agent, "");
+        assert_eq!(legacy.workspace, "b7d87b9c610d01d676c088f03905388d");
+    }
+
+    #[test]
+    fn dsh_usage_chunks_carry_the_request_header_model() {
+        // Shapes captured from a live ~/.dsh session.jsonl (decompressed) on
+        // 2026-09-17.
+        let mut state = DshScanState::new();
+        let session = r#"{"type":"session","version":0,"id":"session-cf88fef4-768c-490d-9dd9-6b72fa7e696c","createdAt":1787044214506,"cwd":"/Users/me/dev/waku","delegationDepth":0}"#;
+        let header = r#"{"type":"request/header","seq":12,"time":1787044263136,"data":{"header":{"config":{"provider":"ollama-cloud","model":"gemma4:cloud","maxTokens":65536}}}}"#;
+        let chunk = r#"{"type":"assistant/chunk","seq":15,"time":1787044263229,"data":{"turn":1,"step":1,"chunk":{"type":"usage","usage":{"inputTokens":11838,"outputTokens":80}}}}"#;
+
+        // Usage before any request/header has no model to attribute.
+        assert!(parse_dsh_line(chunk, &mut state).is_none());
+        assert!(parse_dsh_line(session, &mut state).is_none());
+        assert!(parse_dsh_line(header, &mut state).is_none());
+
+        let record = parse_dsh_line(chunk, &mut state).expect("the model is known now");
+        assert_eq!(record.provider, UsageProvider::DeepSeek);
+        assert_eq!(record.model, "gemma4:cloud");
+        assert_eq!(
+            record.session_id,
+            "session-cf88fef4-768c-490d-9dd9-6b72fa7e696c"
+        );
+        assert_eq!(record.project, "/Users/me/dev/waku");
+        assert_eq!(record.timestamp_ms, 1_787_044_263_229);
+        assert_eq!(record.totals.uncached_input, 11838);
+        assert_eq!(record.totals.output, 80);
+        assert_eq!(record.totals.total(), 11918);
+        assert_eq!(
+            record.dedupe_key.as_deref(),
+            Some("dsh:session-cf88fef4-768c-490d-9dd9-6b72fa7e696c:15")
+        );
+
+        // The zero-usage chunks title-generation requests emit parse to nothing.
+        assert!(parse_dsh_line(
+            r#"{"type":"assistant/chunk","seq":16,"time":1787044263300,"data":{"chunk":{"type":"usage","usage":{"inputTokens":0,"outputTokens":0}}}}"#,
+            &mut state
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn kimi_project_map_resolves_workspace_and_session_names() {
+        // The directory name the older store derives, verified against a live tree.
+        assert_eq!(
+            md5_hex("/Users/jiyuliang/工作/DSP-Modeling/Qi-Pure"),
+            "b7d87b9c610d01d676c088f03905388d"
+        );
+
+        let dir = std::env::temp_dir().join(format!("waku-kimi-map-{}", std::process::id()));
+        let code_home = dir.join(".kimi-code");
+        std::fs::create_dir_all(dir.join(".kimi")).unwrap();
+        std::fs::create_dir_all(&code_home).unwrap();
+        std::fs::write(
+            dir.join(".kimi/kimi.json"),
+            r#"{"work_dirs": [{"path": "/Users/jiyuliang/工作/DSP-Modeling/Qi-Pure", "kaos": "local"}, {"path": "/", "kaos": "local"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            code_home.join("workspaces.json"),
+            r#"{"version":1,"workspaces":{"wd_renamer_77d4205a98d1":{"root":"/Users/jiyuliang/个人/Renamer"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            code_home.join("session_index.jsonl"),
+            concat!(
+                r#"{"sessionId":"ses_3155979c-67f3-4b66-90ca-a0bb7c6d0f0f","sessionDir":"/x","workDir":"/Users/jiyuliang/工作/DSP-Modeling/qi-pure"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let map = kimi_project_map_in(
+            Some(&dir),
+            &code_home,
+            &[PathBuf::from("/Users/me/dev/waku")],
+        );
+        // The modern store resolves the workspace directory name directly.
+        assert_eq!(
+            map.get("wd_renamer_77d4205a98d1").map(String::as_str),
+            Some("/Users/jiyuliang/个人/Renamer")
+        );
+        // Migrated sessions resolve by their own name, not the workspace's.
+        assert_eq!(
+            map.get("ses_3155979c-67f3-4b66-90ca-a0bb7c6d0f0f")
+                .map(String::as_str),
+            Some("/Users/jiyuliang/工作/DSP-Modeling/qi-pure")
+        );
+        // The older store still resolves through its MD5 directory names, and
+        // the app's own roots are included so a launch from one maps too.
+        assert_eq!(
+            map.get("b7d87b9c610d01d676c088f03905388d")
+                .map(String::as_str),
+            Some("/Users/jiyuliang/工作/DSP-Modeling/Qi-Pure")
+        );
+        assert_eq!(
+            map.get(&md5_hex("/Users/me/dev/waku")).map(String::as_str),
+            Some("/Users/me/dev/waku")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

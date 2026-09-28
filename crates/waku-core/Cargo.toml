@@ -29,6 +29,8 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 url = "2"
 uuid = { version = "1.18", features = ["v4", "serde"] }
 waku-protocol = { path = "../waku-protocol" }
+ruzstd = "0.9.0"
+md-5 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -159,7 +159,7 @@ settings.computer_use:
 settings.general_keywords:
   en: general local projects conversations privacy analytics telemetry anonymous sharing updates automatic sparkle version math latex formula expression
 settings.appearance_keywords:
-  en: appearance theme system light dark language english chinese simplified font size text editor
+  en: appearance theme system light dark language english chinese simplified font size text editor sidebar grouping project updated thinking reasoning preview expanded collapsed
 settings.providers_keywords:
   en: providers agents models cli version install detect claude codex cursor opencode opencode2 amp grok pi
 settings.skills:
@@ -318,6 +318,20 @@ settings.code_font_size:
   en: Code font size
 settings.code_font_size_description:
   en: Text size in the file editor, diffs, code blocks, and tool output
+settings.sidebar_grouping:
+  en: Sidebar grouping
+settings.sidebar_grouping_description:
+  en: Group conversations by project or by latest update
+settings.thinking_display:
+  en: Thinking display
+settings.thinking_display_description:
+  en: Choose how much of the agent's thinking and work stays visible
+settings.thinking_display_folded:
+  en: Summary only
+settings.thinking_display_preview:
+  en: Preview
+settings.thinking_display_expanded:
+  en: Show all
 settings.render_math:
   en: Render math expressions
 settings.render_math_description:
@@ -1879,6 +1893,8 @@ transcript.thinking:
   en: Thinking
 transcript.thought_for:
   en: Thought for %{duration}
+transcript.show_full_thought:
+  en: Show full thinking
 transcript.changed_file:
   en: Changed %{count} file
 transcript.changed_files:
@@ -2019,10 +2035,10 @@ usage.day:
   en: Day
 usage.cost_quality:
   en: Cost quality
-usage.provider_reported:
-  en: Provider reported
-usage.model_priced:
-  en: Model priced
+usage.official_priced:
+  en: Official rate
+usage.openrouter_priced:
+  en: OpenRouter rate
 usage.unpriced:
   en: Unpriced
 usage.no_activity_12_months:
@@ -2070,7 +2086,7 @@ usage.active_day_many:
 usage.filter_projects:
   en: Filter projects…
 usage.chart_description:
-  en: Daily %{metric} split between Claude Code and Codex.
+  en: Daily %{metric} for each provider used in this window.
 
 usage.refresh_failed:
   en: "Usage refresh failed: %{error}"

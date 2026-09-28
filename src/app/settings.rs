@@ -1,4 +1,5 @@
 use super::composer::next_picker_highlight;
+use super::sidebar::sidebar_grouping_label;
 use super::*;
 
 const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
@@ -63,6 +64,14 @@ const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 7] = [
         "settings.computer_use_keywords",
     ),
 ];
+
+fn thinking_display_label(display: ThinkingDisplay) -> String {
+    match display {
+        ThinkingDisplay::Folded => tr!("settings.thinking_display_folded"),
+        ThinkingDisplay::Preview => tr!("settings.thinking_display_preview"),
+        ThinkingDisplay::Expanded => tr!("settings.thinking_display_expanded"),
+    }
+}
 
 /// Bind the search field's list-navigation keys. Called once at startup.
 pub fn init(cx: &mut App) {
@@ -1403,6 +1412,68 @@ impl Waku {
             },
         );
 
+        let selected_sidebar_grouping = self.state.sidebar_grouping;
+        let weak = cx.entity().downgrade();
+        let sidebar_grouping_handle = self.menu_handle("sidebar-grouping-selector", cx);
+        let sidebar_grouping_selector = dropdown_menu(
+            MenuChip::new("sidebar-grouping-selector")
+                .label(sidebar_grouping_label(selected_sidebar_grouping))
+                .outlined()
+                .selected(sidebar_grouping_handle.is_open())
+                .w(px(116.0))
+                .justify_between(),
+            "sidebar-grouping-selector-menu",
+            &sidebar_grouping_handle,
+            MenuAlign::BelowRight,
+            move |_| {
+                [SidebarGrouping::Project, SidebarGrouping::Updated]
+                    .into_iter()
+                    .map(|grouping| {
+                        let weak = weak.clone();
+                        MenuItem::new(sidebar_grouping_label(grouping), move |_, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.set_sidebar_grouping(grouping, cx);
+                            });
+                        })
+                        .selected(grouping == selected_sidebar_grouping)
+                    })
+                    .collect()
+            },
+        );
+
+        let selected_thinking_display = self.state.thinking_display;
+        let weak = cx.entity().downgrade();
+        let thinking_display_handle = self.menu_handle("thinking-display-selector", cx);
+        let thinking_display_selector = dropdown_menu(
+            MenuChip::new("thinking-display-selector")
+                .label(thinking_display_label(selected_thinking_display))
+                .outlined()
+                .selected(thinking_display_handle.is_open())
+                .w(px(116.0))
+                .justify_between(),
+            "thinking-display-selector-menu",
+            &thinking_display_handle,
+            MenuAlign::BelowRight,
+            move |_| {
+                [
+                    ThinkingDisplay::Folded,
+                    ThinkingDisplay::Preview,
+                    ThinkingDisplay::Expanded,
+                ]
+                .into_iter()
+                .map(|display| {
+                    let weak = weak.clone();
+                    MenuItem::new(thinking_display_label(display), move |_, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.set_thinking_display(display, cx);
+                        });
+                    })
+                    .selected(display == selected_thinking_display)
+                })
+                .collect()
+            },
+        );
+
         div()
             .mt(px(15.0))
             .w_full()
@@ -1538,6 +1609,70 @@ impl Waku {
                     )
                     .child(code_font_size_selector),
             )
+            .child(div().mx(px(20.0)).h(px(1.0)).bg(theme.border))
+            .child(
+                div()
+                    .w_full()
+                    .min_h(px(60.0))
+                    .px(px(20.0))
+                    .py(px(12.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(24.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(sp(13.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(tr!("settings.sidebar_grouping")),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(5.0))
+                                    .text_size(sp(12.5))
+                                    .line_height(sp(18.0))
+                                    .text_color(theme.text_secondary)
+                                    .child(tr!("settings.sidebar_grouping_description")),
+                            ),
+                    )
+                    .child(sidebar_grouping_selector),
+            )
+            .child(div().mx(px(20.0)).h(px(1.0)).bg(theme.border))
+            .child(
+                div()
+                    .w_full()
+                    .min_h(px(60.0))
+                    .px(px(20.0))
+                    .py(px(12.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(24.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(sp(13.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(tr!("settings.thinking_display")),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(5.0))
+                                    .text_size(sp(12.5))
+                                    .line_height(sp(18.0))
+                                    .text_color(theme.text_secondary)
+                                    .child(tr!("settings.thinking_display_description")),
+                            ),
+                    )
+                    .child(thinking_display_selector),
+            )
             .into_any_element()
     }
 
@@ -1547,6 +1682,19 @@ impl Waku {
         }
         self.state.render_math = enabled;
         self.remeasure_font_sized_surfaces();
+        self.save();
+        cx.notify();
+    }
+
+    fn set_thinking_display(&mut self, display: ThinkingDisplay, cx: &mut Context<Self>) {
+        if self.state.thinking_display == display {
+            return;
+        }
+        self.state.thinking_display = display;
+        self.reasoning_previews_expanded.clear();
+        self.reasoning_preview_cache.borrow_mut().clear();
+        self.transcript_row_kinds_fingerprint.set(None);
+        self.assistant_footer_fingerprint.set(None);
         self.save();
         cx.notify();
     }

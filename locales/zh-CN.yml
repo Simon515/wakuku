@@ -77,11 +77,11 @@ settings.usage: 用量
 settings.daemon: 守护进程
 settings.computer_use: 电脑操作
 settings.general_keywords: 通用 本地 项目 对话 隐私 匿名 使用数据 分析 分享 更新 自动 版本 数学 公式 表达式 math latex
-settings.appearance_keywords: 外观 主题 系统 浅色 深色 语言 英语 中文 简体 字号 字体 大小 编辑器
+settings.appearance_keywords: 外观 主题 系统 浅色 深色 语言 英语 中文 简体 字号 字体 大小 编辑器 侧栏 分组 项目 更新时间 思考 推理 预览 展开 折叠
 settings.providers_keywords: 服务商 智能体 模型 命令行 版本 安装 检测 claude codex cursor opencode opencode2 amp grok pi
 settings.skills: 技能
 settings.skills_keywords: 技能 技能库 智能体 禁用 启用 删除 claude codex cursor opencode pi amp 共享
-settings.usage_keywords: 用量 令牌 费用 支出 缓存 每日 图表 模型 明细 历史 claude codex
+settings.usage_keywords: 用量 token 费用 支出 缓存 每日 图表 模型 明细 历史 claude codex
 settings.daemon_keywords: 守护进程 服务 远程 网页 网络 暴露 来源 令牌 端口 websocket
 settings.computer_use_keywords: 电脑操作 屏幕录制 辅助功能 应用 控制 codex
 settings.back: 返回
@@ -157,6 +157,13 @@ settings.ui_font_size: 界面字号
 settings.ui_font_size_description: 整个界面与消息的文字大小
 settings.code_font_size: 代码字号
 settings.code_font_size_description: 文件编辑器、差分视图、代码块与工具输出的文字大小
+settings.sidebar_grouping: 会话分组
+settings.sidebar_grouping_description: 会话按项目或最近更新时间分组显示
+settings.thinking_display: 思考过程显示
+settings.thinking_display_description: 选择智能体思考和执行过程的显示程度
+settings.thinking_display_folded: 仅显示摘要
+settings.thinking_display_preview: 显示预览
+settings.thinking_display_expanded: 全部显示
 settings.render_math: 渲染数学公式
 settings.render_math_description: 在 Markdown 中显示排版后的公式。关闭后显示 LaTeX 源码。
 settings.theme_system: 跟随系统
@@ -906,6 +913,7 @@ transcript.you_stopped_after: 你在工作 %{duration} 后停止了
 transcript.working_for: 工作中 · %{duration}
 transcript.thinking: 正在思考
 transcript.thought_for: 思考用时 %{duration}
+transcript.show_full_thought: 显示完整思考过程
 transcript.changed_file: 更改了 %{count} 个文件
 transcript.changed_files: 更改了 %{count} 个文件
 transcript.review_changes: 审阅
@@ -935,56 +943,56 @@ usage.rescan: 重新扫描服务商的对话记录
 usage.range: "%{start} 至 %{end}"
 usage.full_api_rate_note: "* 按完整 API 费率估算"
 usage.sessions_summary: 汇总 %{count} 个任务的输入、缓存读取和输出
-usage.raw_token_cost: 原始令牌费用
-usage.processed_tokens_upper: 已处理令牌
-usage.cost_share: 占费用的 %{share} · %{tokens} 个令牌
-usage.token_share: 占令牌的 %{share} · %{cost}
+usage.raw_token_cost: 原始 token 费用
+usage.processed_tokens_upper: 已处理 token
+usage.cost_share: 占费用的 %{share} · %{tokens} token
+usage.token_share: 占 token 的 %{share} · %{cost}
 usage.no_activity_window: 所选时段内没有活动
 usage.cost_upper: 费用
-usage.tokens_upper: 令牌
+usage.tokens_upper: token
 usage.daily_cost: 每日费用
-usage.daily_processed_tokens: 每日已处理令牌
+usage.daily_processed_tokens: 每日已处理 token
 usage.model_upper: 模型
 usage.day_upper: 日期
 usage.breakdown: 明细
 usage.no_projects_match: 没有符合筛选条件的项目
 usage.by_project: 按项目
-usage.projects_caption: "%{projects} · %{tokens} 个令牌 · %{sessions}"
+usage.projects_caption: "%{projects} · %{tokens} token · %{sessions}"
 usage.projects_shown: "共 %{projects}，当前显示 %{shown} 个"
 usage.percent_of_cost: 占费用的 %{share}
-usage.token_count: "%{count} 个令牌"
+usage.token_count: "%{count} token"
 usage.last_active: 最后活跃于 %{date}
 usage.show_models: 查看 %{models}的费用明细
 usage.other_sessions: 其他任务
 usage.rates_unavailable: 模型费率暂不可用；费率表加载完成前，相关费用会显示为未定价
 usage.total: 总计
-usage.processed_tokens: 已处理令牌
+usage.processed_tokens: 已处理 token
 usage.per_active_day: 每个活跃日 %{count}
 usage.cached_input: 缓存输入
 usage.observed_input_share: 占已统计输入的 %{share}
 usage.uncached_input: 未缓存输入
-usage.cache_writes: "%{count} 个缓存写入令牌"
+usage.cache_writes: "%{count} 个缓存写入 token"
 usage.output: 输出
-usage.includes_reasoning: 其中推理令牌 %{count}
+usage.includes_reasoning: 其中推理 token %{count}
 usage.cache_savings: 缓存节省
-usage.raw_cost_multiple: 相当于原始令牌费用的 %{multiple} 倍
+usage.raw_cost_multiple: 相当于原始 token 费用的 %{multiple} 倍
 usage.vs_full_input_rates: 与完整输入费率相比
 usage.model: 模型
 usage.cost: 费用
 usage.share: 占比
-usage.tokens: 令牌
+usage.tokens: token
 usage.day: 日期
 usage.cost_quality: 费用可信度
-usage.provider_reported: 服务商报告
-usage.model_priced: 按模型定价
+usage.official_priced: 官方定价
+usage.openrouter_priced: OpenRouter 定价
 usage.unpriced: 未定价
 usage.no_activity_12_months: 过去 12 个月内没有活动
 usage.last_12_months: 过去 12 个月
 usage.so_far: 截至目前
 usage.no_activity: 没有活动
 usage.models_by_spend: "%{models} · 按费用排序"
-usage.tokens_and_sessions: "%{tokens} 个令牌 · %{sessions}"
-usage.month_caption: "%{tokens} 个令牌 · %{sessions} · %{days}"
+usage.tokens_and_sessions: "%{tokens} token · %{sessions}"
+usage.month_caption: "%{tokens} token · %{sessions} · %{days}"
 usage.last_7_days: 过去 7 天
 usage.last_30_days: 过去 30 天
 usage.last_90_days: 过去 90 天
@@ -1000,7 +1008,7 @@ usage.model_many: "%{count} 个模型"
 usage.active_day_one: "%{count} 个活跃日"
 usage.active_day_many: "%{count} 个活跃日"
 usage.filter_projects: 筛选项目…
-usage.chart_description: Claude Code 与 Codex 的每日%{metric}分布。
+usage.chart_description: 本窗口内各服务商的每日%{metric}。
 usage.refresh_failed: "用量刷新失败：%{error}"
 usage.context_used: 上下文窗口已使用 %{percent}%（%{shortcut}）
 usage.shortcut: 用量（%{shortcut}）

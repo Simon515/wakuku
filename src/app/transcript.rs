@@ -18,7 +18,11 @@ impl Waku {
         let fingerprint = self
             .selected_session()
             .map_or(EMPTY_TRANSCRIPT_FINGERPRINT, |session| {
-                transcript_rows_fingerprint(session, &self.expanded_turns)
+                transcript_rows_fingerprint_with_work_visibility(
+                    session,
+                    &self.expanded_turns,
+                    self.state.thinking_display != ThinkingDisplay::Folded,
+                )
             });
         if self.transcript_row_kinds_fingerprint.get() != Some(fingerprint) {
             let next_kinds = self.selected_transcript_row_kinds();
@@ -30,7 +34,11 @@ impl Waku {
 
     pub(super) fn selected_transcript_row_kinds(&self) -> Vec<TranscriptRowKind> {
         self.selected_session().map_or_else(Vec::new, |session| {
-            folded_transcript_row_kinds(session, &self.expanded_turns)
+            folded_transcript_row_kinds_with_work_visibility(
+                session,
+                &self.expanded_turns,
+                self.state.thinking_display != ThinkingDisplay::Folded,
+            )
         })
     }
 
@@ -815,19 +823,32 @@ pub(super) fn transcript_row_kinds(
     rows
 }
 
-/// Fingerprint of every field [`folded_transcript_row_kinds`] reads, so a frame
-/// can tell a settled transcript from a changed one without refolding it.
+/// The default-disclosure fingerprint, for tests that do not exercise the
+/// thinking-display setting.
+#[cfg(test)]
+pub(super) fn transcript_rows_fingerprint(
+    session: &AgentSession,
+    expanded_turns: &HashSet<Uuid>,
+) -> u64 {
+    transcript_rows_fingerprint_with_work_visibility(session, expanded_turns, false)
+}
+
+/// Fingerprint of every field [`folded_transcript_row_kinds_with_work_visibility`]
+/// reads, so a frame can tell a settled transcript from a changed one without
+/// refolding it.
 ///
 /// Keep this in step with that function and with [`row_turn_id`]. A field they
 /// consult but this one misses leaves the cached rows stale, and stale rows
 /// fall back to `Message(n)` — silently dropping every reasoning block and tool
 /// activity from the transcript. Cheap mixing, not a real hash: this runs on
 /// the frame path, and the values it folds in are already well distributed.
-pub(super) fn transcript_rows_fingerprint(
+pub(super) fn transcript_rows_fingerprint_with_work_visibility(
     session: &AgentSession,
     expanded_turns: &HashSet<Uuid>,
+    show_turn_work: bool,
 ) -> u64 {
     let mut hash = mix_uuid(EMPTY_TRANSCRIPT_FINGERPRINT, session.id);
+    hash = mix(hash, show_turn_work as u64);
 
     // The working indicator row exists only while the session is busy, and a
     // driver error can drop the busy status without touching any turn — the
@@ -894,6 +915,16 @@ fn mix_turn_id(hash: u64, turn_id: Option<Uuid>) -> u64 {
     }
 }
 
+/// The default-disclosure fold, for tests that do not exercise the
+/// thinking-display setting.
+#[cfg(test)]
+pub(super) fn folded_transcript_row_kinds(
+    session: &AgentSession,
+    expanded_turns: &HashSet<Uuid>,
+) -> Vec<TranscriptRowKind> {
+    folded_transcript_row_kinds_with_work_visibility(session, expanded_turns, false)
+}
+
 /// A settled turn presents its answer — the trailing run of assistant text —
 /// under a single work summary row standing in for everything that came
 /// before it: reasoning, tool activity and interim commentary alike.
@@ -904,11 +935,17 @@ fn mix_turn_id(hash: u64, turn_id: Option<Uuid>) -> u64 {
 /// 19 seconds" with more work listed below it, as if the response had been cut
 /// in half. Expanding it restores the turn's full order in place.
 ///
-/// Every field this reads is fingerprinted by [`transcript_rows_fingerprint`]
-/// so frames can skip the fold; consult a new one and that must learn it too.
-pub(super) fn folded_transcript_row_kinds(
+/// When `show_turn_work` is set, the thinking-display setting keeps that work
+/// in place by default: the fold anchor still renders, but nothing is hidden
+/// behind it unless the user opens the turn themselves.
+///
+/// Every field this reads is fingerprinted by
+/// [`transcript_rows_fingerprint_with_work_visibility`] so frames can skip the
+/// fold; consult a new one and that must learn it too.
+pub(super) fn folded_transcript_row_kinds_with_work_visibility(
     session: &AgentSession,
     expanded_turns: &HashSet<Uuid>,
+    show_turn_work: bool,
 ) -> Vec<TranscriptRowKind> {
     let anchors = session
         .transcript_blocks
@@ -941,8 +978,8 @@ pub(super) fn folded_transcript_row_kinds(
         if let Some(turn_id) = fold_anchors.get(&row).copied() {
             rows.push(TranscriptRowKind::TurnFold(turn_id));
         }
-        let expanded =
-            row_turn_id(session, row).is_some_and(|turn_id| expanded_turns.contains(&turn_id));
+        let expanded = show_turn_work
+            || row_turn_id(session, row).is_some_and(|turn_id| expanded_turns.contains(&turn_id));
         if expanded || !hidden_rows.contains(&row) {
             rows.push(row);
         }

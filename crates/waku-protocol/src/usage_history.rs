@@ -93,15 +93,35 @@ use chrono::Datelike as _;
 pub enum UsageProvider {
     Claude,
     Codex,
+    DeepSeek,
+    Kimi,
+    OhMyPi,
+    Pi,
 }
 
 impl UsageProvider {
-    pub const ALL: [UsageProvider; 2] = [UsageProvider::Claude, UsageProvider::Codex];
+    pub const ALL: [UsageProvider; 6] = [
+        UsageProvider::Claude,
+        UsageProvider::Codex,
+        UsageProvider::DeepSeek,
+        UsageProvider::Kimi,
+        UsageProvider::OhMyPi,
+        UsageProvider::Pi,
+    ];
+
+    /// Width of the per-provider lanes in the wire types. Every
+    /// `[ProviderDay; _]` array is indexed by [`UsageProvider::index`], so
+    /// this must stay in lockstep with `ALL`.
+    pub const COUNT: usize = 6;
 
     pub fn label(self) -> &'static str {
         match self {
             UsageProvider::Claude => "Claude Code",
             UsageProvider::Codex => "Codex",
+            UsageProvider::DeepSeek => "DeepSeek",
+            UsageProvider::Kimi => "Kimi Code",
+            UsageProvider::OhMyPi => "Oh My Pi",
+            UsageProvider::Pi => "Pi",
         }
     }
 
@@ -109,6 +129,10 @@ impl UsageProvider {
         match self {
             UsageProvider::Claude => 0,
             UsageProvider::Codex => 1,
+            UsageProvider::DeepSeek => 2,
+            UsageProvider::Kimi => 3,
+            UsageProvider::OhMyPi => 4,
+            UsageProvider::Pi => 5,
         }
     }
 }
@@ -163,6 +187,7 @@ pub struct ModelSlice {
     pub cost_usd: f64,
     pub total_tokens: u64,
     pub cost_share: f64,
+    pub token_share: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, TS)]
@@ -178,14 +203,17 @@ pub struct DaySlice {
     pub day: NaiveDate,
     pub cost_usd: f64,
     pub total_tokens: u64,
-    pub by_provider: [ProviderDay; 2],
+    pub by_provider: [ProviderDay; UsageProvider::COUNT],
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CostQuality {
-    pub provider_reported_share: f64,
-    pub model_priced_share: f64,
+    /// Records priced from the official model rate table.
+    pub official_priced_share: f64,
+    /// Records priced from OpenRouter's catalog because the official table
+    /// omits the model.
+    pub openrouter_priced_share: f64,
     pub unpriced_share: f64,
     pub cache_savings_usd: f64,
 }
@@ -196,7 +224,7 @@ pub struct MonthSlice {
     pub first_day: NaiveDate,
     pub cost_usd: f64,
     pub total_tokens: u64,
-    pub by_provider: [ProviderDay; 2],
+    pub by_provider: [ProviderDay; UsageProvider::COUNT],
     pub sessions: u64,
     pub active_days: u32,
     pub top_models: Vec<(String, f64)>,
@@ -208,7 +236,7 @@ pub struct ProjectSlice {
     pub path: String,
     pub cost_usd: f64,
     pub total_tokens: u64,
-    pub by_provider: [ProviderDay; 2],
+    pub by_provider: [ProviderDay; UsageProvider::COUNT],
     pub sessions: u64,
     pub cost_share: f64,
     pub last_day: Option<NaiveDate>,
@@ -253,5 +281,46 @@ impl UsageHistory {
             .binary_search_by_key(&first_day, |slice| slice.first_day)
             .ok()
             .map(|index| &self.months[index])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The provider lanes are positional on the wire, so a provider inserted
+    /// into `ALL` without a matching `index` arm would silently shift every
+    /// lane after it — one provider's numbers read as another's.
+    #[test]
+    fn provider_lanes_match_all_order_and_fill_the_wire_arrays() {
+        assert_eq!(UsageProvider::ALL.len(), UsageProvider::COUNT);
+        for (lane, provider) in UsageProvider::ALL.into_iter().enumerate() {
+            assert_eq!(
+                provider.index(),
+                lane,
+                "{provider:?} is not in its own lane"
+            );
+        }
+    }
+
+    /// The web client hardcodes these spellings in `usage-presentation.ts`, and
+    /// its lane map is derived from the array order asserted above.
+    #[test]
+    fn provider_wire_keys_are_stable() {
+        let keys: Vec<String> = UsageProvider::ALL
+            .into_iter()
+            .map(|provider| {
+                serde_json::to_value(provider)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+
+        assert_eq!(
+            keys,
+            ["claude", "codex", "deepSeek", "kimi", "ohMyPi", "pi"]
+        );
     }
 }

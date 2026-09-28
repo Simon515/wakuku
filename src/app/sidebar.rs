@@ -89,7 +89,7 @@ impl SidebarGroup {
     }
 }
 
-fn sidebar_grouping_label(grouping: SidebarGrouping) -> String {
+pub(super) fn sidebar_grouping_label(grouping: SidebarGrouping) -> String {
     match grouping {
         SidebarGrouping::Project => tr!("sidebar.grouping_project"),
         SidebarGrouping::Updated => tr!("sidebar.grouping_updated"),
@@ -1687,7 +1687,11 @@ impl Waku {
         }
     }
 
-    fn set_sidebar_grouping(&mut self, grouping: SidebarGrouping, cx: &mut Context<Self>) {
+    pub(super) fn set_sidebar_grouping(
+        &mut self,
+        grouping: SidebarGrouping,
+        cx: &mut Context<Self>,
+    ) {
         if self.state.sidebar_grouping == grouping {
             return;
         }

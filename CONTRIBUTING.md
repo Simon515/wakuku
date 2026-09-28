@@ -32,7 +32,7 @@ bun install
 bun run dev
 ```
 
-On macOS the watcher builds and signs `target/debug/Waku Debug.app`; on Linux
+On macOS the watcher builds and signs `target/debug/wakuku.app`; on Linux
 and Windows it builds `target/debug/waku`. In both cases the provider daemon remains an
 external `target/debug/waku-debug-daemon`: provider-only edits rebuild and
 hot-swap that process without relaunching the app, while desktop edits rebuild

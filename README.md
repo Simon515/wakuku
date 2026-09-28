@@ -89,7 +89,7 @@ attachments already use daemon RPC.
 
 Release apps bundle and sign `waku-daemon`. Development keeps the daemon at
 `target/debug/waku-debug-daemon`, allowing provider-only edits to rebuild and
-replace the daemon without relaunching Waku Debug.
+replace the daemon without relaunching wakuku.
 
 ## Development
 

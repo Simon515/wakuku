@@ -81,7 +81,7 @@ settings.usage: 使用状況
 settings.daemon: デーモン
 settings.computer_use: コンピュータ操作
 settings.general_keywords: 一般 ローカル プロジェクト 会話 プライバシー 分析 テレメトリ 匿名 共有 アップデート 自動 バージョン 数学 数式 math latex
-settings.appearance_keywords: 外観 テーマ システム ライト ダーク 言語 英語 中国語 簡体字 日本語 フォント サイズ 文字 エディタ
+settings.appearance_keywords: 外観 テーマ システム ライト ダーク 言語 英語 中国語 簡体字 日本語 フォント サイズ 文字 エディタ サイドバー グループ化 プロジェクト 更新日 思考 推論 プレビュー 展開 折りたたみ
 settings.providers_keywords: プロバイダー エージェント モデル CLI バージョン インストール 検出 claude codex cursor opencode opencode2 amp grok pi
 settings.skills: スキル
 settings.skills_keywords: スキル ライブラリ エージェント 無効 有効 削除 claude codex cursor opencode pi amp 共有
@@ -161,6 +161,13 @@ settings.ui_font_size: UI のフォントサイズ
 settings.ui_font_size_description: インターフェース全体とメッセージの文字サイズ
 settings.code_font_size: コードのフォントサイズ
 settings.code_font_size_description: ファイルエディタ、差分表示、コードブロック、ツール出力の文字サイズ
+settings.sidebar_grouping: サイドバーのグループ化
+settings.sidebar_grouping_description: 会話をプロジェクト別または更新日時別にグループ化します
+settings.thinking_display: 思考プロセスの表示
+settings.thinking_display_description: エージェントの思考と作業をどの程度表示するか選択します
+settings.thinking_display_folded: 概要のみ
+settings.thinking_display_preview: プレビュー
+settings.thinking_display_expanded: すべて表示
 settings.render_math: 数式を描画
 settings.render_math_description: Markdown の数式を整形して表示します。オフにすると LaTeX ソースを表示します。
 settings.theme_system: システム
@@ -955,6 +962,7 @@ transcript.you_stopped_after: "%{duration} 後にタスクを停止しました"
 transcript.working_for: 作業中 · %{duration}
 transcript.thinking: 思考中
 transcript.thought_for: 思考時間 %{duration}
+transcript.show_full_thought: 思考プロセスをすべて表示
 transcript.changed_file: "%{count} 個のファイルを変更"
 transcript.changed_files: "%{count} 個のファイルを変更"
 transcript.review_changes: レビュー
@@ -1026,8 +1034,8 @@ usage.share: 割合
 usage.tokens: トークン
 usage.day: 日付
 usage.cost_quality: コストの信頼度
-usage.provider_reported: プロバイダー報告値
-usage.model_priced: モデル料金から算出
+usage.official_priced: 公式料金
+usage.openrouter_priced: OpenRouter 料金
 usage.unpriced: 未算出
 usage.no_activity_12_months: 過去 12 か月間のアクティビティはありません
 usage.last_12_months: 過去 12 か月
@@ -1051,7 +1059,7 @@ usage.model_many: "%{count} 個のモデル"
 usage.active_day_one: "アクティブ %{count} 日"
 usage.active_day_many: "アクティブ %{count} 日"
 usage.filter_projects: プロジェクトを絞り込む…
-usage.chart_description: "Claude Code と Codex の日別 %{metric}。"
+usage.chart_description: "このウインドウで使用したプロバイダーごとの日別 %{metric}。"
 usage.refresh_failed: "使用状況の更新に失敗しました：%{error}"
 usage.context_used: コンテキストウインドウを %{percent}% 使用（%{shortcut}）
 usage.shortcut: 使用状況（%{shortcut}）

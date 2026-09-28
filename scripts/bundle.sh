@@ -38,8 +38,8 @@ else
 fi
 case "$profile" in
   debug)
-    app_name="Waku Debug"
-    helper_name="Waku Debug Computer Use"
+    app_name="wakuku"
+    helper_name="wakuku Computer Use"
     bundle_identifier="sh.waku.dev"
     icon_file="AppIconDev.icns"
     ;;
@@ -63,7 +63,7 @@ if [ "${WAKU_SKIP_CARGO_BUILD:-0}" != "1" ]; then
   if [ "$profile" = "release" ]; then
     cargo build --release --package waku --bin waku --bin waku_js_repl --package waku-daemon --bin waku-daemon
   else
-    cargo build --package waku --bin waku --bin waku_js_repl
+    cargo build --package waku --bin waku --bin waku_js_repl --package waku-daemon --bin waku-daemon
   fi
 fi
 
@@ -166,10 +166,11 @@ mkdir -p "$contents/MacOS" "$contents/Resources/computer-use" "$contents/Resourc
 cp "$cargo_target_dir/$profile/waku" "$contents/MacOS/$app_name"
 cp "$cargo_target_dir/$profile/waku_js_repl" "$repl_executable"
 chmod 755 "$repl_executable"
-if [ "$profile" = "release" ]; then
-  cp "$cargo_target_dir/$profile/waku-daemon" "$daemon_executable"
-  chmod 755 "$daemon_executable"
-fi
+# Release apps carry the daemon inside the bundle. The debug bundle now does
+# too, so a copied debug app runs standalone instead of insisting on Cargo's
+# debug directory.
+cp "$cargo_target_dir/$profile/waku-daemon" "$daemon_executable"
+chmod 755 "$daemon_executable"
 cp resources/Info.plist "$contents/Info.plist"
 cp "resources/$icon_file" "$contents/Resources/AppIcon.icns"
 cp resources/computer-use/pi-extension.ts "$contents/Resources/computer-use/pi-extension.ts"
@@ -201,9 +202,7 @@ if [ "$codesign_identity" = "-" ]; then
   codesign --force --sign - "$sparkle_framework/Versions/B/Updater.app"
   codesign --force --sign - "$sparkle_framework"
   codesign --force --identifier "$bundle_identifier.js-repl" --sign - "$repl_executable"
-  if [ "$profile" = "release" ]; then
-    codesign --force --identifier "$bundle_identifier.daemon" --sign - "$daemon_executable"
-  fi
+  codesign --force --identifier "$bundle_identifier.daemon" --sign - "$daemon_executable"
   if [ "$profile" = "debug" ]; then
     # An ordinary ad-hoc signature's designated requirement contains its
     # changing code hash, so macOS TCC treats every rebuild as a different app
@@ -226,6 +225,7 @@ else
   codesign --force --options runtime --sign "$codesign_identity" "$sparkle_framework/Versions/B/Updater.app"
   codesign --force --options runtime --sign "$codesign_identity" "$sparkle_framework"
   codesign --force --options runtime --identifier "$bundle_identifier.js-repl" --sign "$codesign_identity" "$repl_executable"
+  codesign --force --options runtime --identifier "$bundle_identifier.daemon" --sign "$codesign_identity" "$daemon_executable"
   codesign --force --options runtime --sign "$codesign_identity" "$bundle"
 fi
 if [ "$profile" = "release" ]; then

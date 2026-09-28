@@ -11,16 +11,17 @@ use super::{
     append_text_delta_to_session, assistant_response_footer, assistant_response_footer_index,
     assistant_response_footer_time, compact_driver_error, disclosure_leading_space, fenced_code,
     fitted_file_tree_width, fitted_panel_widths, folded_transcript_row_kinds,
-    format_worked_duration, format_working_elapsed, maintain_transcript_anchor, message_opens_turn,
+    folded_transcript_row_kinds_with_work_visibility, format_worked_duration,
+    format_working_elapsed, maintain_transcript_anchor, message_opens_turn,
     message_starts_followup_turn, navigation_preview_snippet, navigation_rail_fade_visibility,
     navigation_rail_height, navigation_rail_scale, paused_toast_duration, pop_stream_batch,
-    push_transcript_activity, response_footer_message_index, response_row_turn_id,
-    session_accepts_turn_output, session_is_reapable, should_refresh_branch_after_activity,
-    should_show_navigation_rail, should_show_scroll_to_bottom, task_id_from_notification_tag,
-    task_notification_tag, transcript_anchor_end_space, transcript_navigation_turns,
-    transcript_rests_at_tail, transcript_row_kinds, transcript_row_splice,
-    transcript_rows_fingerprint, widened_panel_width_for_file_editor,
-    widened_panel_width_for_review,
+    push_transcript_activity, reasoning_preview_content, response_footer_message_index,
+    response_row_turn_id, session_accepts_turn_output, session_is_reapable,
+    should_refresh_branch_after_activity, should_show_navigation_rail,
+    should_show_scroll_to_bottom, task_id_from_notification_tag, task_notification_tag,
+    transcript_anchor_end_space, transcript_navigation_turns, transcript_rests_at_tail,
+    transcript_row_kinds, transcript_row_splice, transcript_rows_fingerprint,
+    widened_panel_width_for_file_editor, widened_panel_width_for_review,
 };
 use crate::git_branch::BranchEntry;
 use crate::model::{
@@ -1417,6 +1418,12 @@ fn a_settled_turn_folds_all_of_its_work_above_the_answer() {
             ResponseFooter(turn_id, 2),
         ]
     );
+    // Preview and Expanded modes keep the work rows visible without requiring
+    // the user to open the turn fold first.
+    assert_eq!(
+        folded_transcript_row_kinds_with_work_visibility(&session, &HashSet::new(), true),
+        folded_transcript_row_kinds(&session, &HashSet::from([turn_id]))
+    );
 }
 
 /// Providers split one answer across several text parts. They arrive with no
@@ -2152,4 +2159,27 @@ fn the_rail_draws_only_installed_providers_the_settings_left_on() {
         Some(ProviderKind::Claude),
         ProviderKind::Claude
     ));
+}
+
+#[test]
+fn reasoning_preview_caps_long_prose_and_marks_the_hidden_tail() {
+    let content = (0..20)
+        .map(|index| format!("Step {index}: inspect the next part."))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (preview, truncated) = reasoning_preview_content(&content);
+
+    assert!(truncated);
+    assert!(preview.lines().count() <= 11);
+    assert!(preview.ends_with('…'));
+}
+
+#[test]
+fn reasoning_preview_closes_an_incomplete_fenced_block() {
+    let content =
+        "```rust\nfn inspect() {\n    let answer = 42;\n}\n```\n\nMore detail\n".repeat(4);
+    let (preview, truncated) = reasoning_preview_content(&content);
+
+    assert!(truncated);
+    assert!(preview.ends_with("```"));
 }
